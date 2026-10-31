@@ -28,7 +28,9 @@ const API_KEY = "e2e-" + "x".repeat(40);
 const PASSWORD = "contraseña-e2e";
 const EMAIL_TO = "destinatario@example.com";
 const RECORD_SECONDS = Number(process.env.E2E_RECORD_SECONDS || 40);
-const DATABASE_URL = `postgres://postgres@127.0.0.1:${PG_PORT}/postgres`;
+// En CI se usa un Postgres externo (E2E_DATABASE_URL); en local se arranca uno propio.
+const EXTERNAL_DB = process.env.E2E_DATABASE_URL;
+const DATABASE_URL = EXTERNAL_DB || `postgres://postgres@127.0.0.1:${PG_PORT}/postgres`;
 
 const children = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -75,6 +77,7 @@ function cleanup() {
       c.kill("SIGTERM");
     } catch {}
   }
+  if (EXTERNAL_DB) return;
   try {
     execFileSync("runuser", ["-u", "postgres", "--", `${PG_BIN}/pg_ctl`, "-D", path.join(TMP, "pg"), "-m", "fast", "stop"], { stdio: "ignore" });
   } catch {}
@@ -90,16 +93,20 @@ log("generando audio de prueba");
 execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=180", "-ar", "48000", "-ac", "1", path.join(TMP, "tab.wav")]);
 execFileSync("ffmpeg", ["-v", "error", "-f", "lavfi", "-i", "sine=frequency=1500:duration=180", "-ar", "48000", "-ac", "1", path.join(TMP, "mic.wav")]);
 
-log("iniciando Postgres");
-const pgDir = path.join(TMP, "pg");
-mkdirSync(pgDir);
-execSync(`chown postgres:postgres ${pgDir} && chmod 700 ${pgDir}`);
-execFileSync("runuser", ["-u", "postgres", "--", `${PG_BIN}/initdb`, "-D", pgDir, "-A", "trust", "-U", "postgres"], { stdio: "ignore" });
-execFileSync(
-  "runuser",
-  ["-u", "postgres", "--", `${PG_BIN}/pg_ctl`, "-D", pgDir, "-l", path.join(pgDir, "log"), "-o", `-p ${PG_PORT} -k ${pgDir} -c listen_addresses=127.0.0.1`, "-w", "start"],
-  { stdio: "ignore" },
-);
+if (EXTERNAL_DB) {
+  log("usando Postgres externo (E2E_DATABASE_URL)");
+} else {
+  log("iniciando Postgres");
+  const pgDir = path.join(TMP, "pg");
+  mkdirSync(pgDir);
+  execSync(`chown postgres:postgres ${pgDir} && chmod 700 ${pgDir}`);
+  execFileSync("runuser", ["-u", "postgres", "--", `${PG_BIN}/initdb`, "-D", pgDir, "-A", "trust", "-U", "postgres"], { stdio: "ignore" });
+  execFileSync(
+    "runuser",
+    ["-u", "postgres", "--", `${PG_BIN}/pg_ctl`, "-D", pgDir, "-l", path.join(pgDir, "log"), "-o", `-p ${PG_PORT} -k ${pgDir} -c listen_addresses=127.0.0.1`, "-w", "start"],
+    { stdio: "ignore" },
+  );
+}
 
 log("iniciando proveedores simulados");
 startProc("mock", process.execPath, [path.join(ROOT, "e2e", "mock-providers.mjs")], {

@@ -23,7 +23,7 @@ const CHECK_LABELS: Record<string, string> = {
   database: "Base de datos",
   apiKey: "Clave de la extensión",
   transcription: "Transcripción (Groq gratis o Deepgram)",
-  anthropic: "IA (Anthropic)",
+  analysis: "Análisis con IA (Claude o Groq gratis)",
   resend: "Correo (Resend)",
 };
 

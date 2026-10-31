@@ -129,13 +129,29 @@ const appEnv = {
   // Transcripción gratuita (Whisper en Groq). Sin clave de Deepgram, se usa Groq.
   GROQ_API_KEY: "test-groq",
   GROQ_API_URL: `http://127.0.0.1:${MOCK_PORT}/groq`,
-  ANTHROPIC_API_KEY: "test-anthropic",
-  ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_PORT}/anthropic`,
+  // Sin clave de Anthropic → análisis gratuito en Groq. Tramos y presupuesto de tiempo diminutos
+  // para obligar a dividir, combinar y continuar en varias invocaciones.
+  ANALYSIS_CHUNK_TOKENS: "80",
+  PROCESSING_BUDGET_MS: "2500",
   RESEND_API_KEY: "test-resend",
   RESEND_API_URL: `http://127.0.0.1:${MOCK_PORT}/resend`,
 };
-startProc("next", path.join(ROOT, "node_modules", ".bin", "next"), ["start", "-p", String(APP_PORT), "-H", "127.0.0.1"], { cwd: ROOT, env: appEnv });
-await waitFor(async () => (await fetch(`${APP}/api/health`)).ok, { label: "servidor Next", timeout: 60000 });
+let nextProc = null;
+async function startApp(extraEnv = {}) {
+  nextProc = startProc("next", path.join(ROOT, "node_modules", ".bin", "next"), ["start", "-p", String(APP_PORT), "-H", "127.0.0.1"], {
+    cwd: ROOT,
+    env: { ...appEnv, ...extraEnv },
+  });
+  await waitFor(async () => (await fetch(`${APP}/api/health`)).ok, { label: "servidor Next", timeout: 60000 });
+}
+async function stopApp() {
+  const p = nextProc;
+  if (!p || p.exitCode !== null) return;
+  const exited = new Promise((r) => p.once("exit", r));
+  p.kill("SIGTERM");
+  await exited;
+}
+await startApp();
 
 const db = new Client({ connectionString: DATABASE_URL });
 await db.connect();
@@ -348,20 +364,31 @@ check("se descartan las frases que Whisper inventa sobre el silencio", () =>
   assert.ok(!/Amara/.test(row.transcript_text), row.transcript_text),
 );
 
-const an = captured.anthropic[0];
-check("Claude recibe la transcripción con salida estructurada", () => {
-  assert.ok(an, "no hubo llamada");
-  assert.equal(an.auth, "Bearer test-anthropic");
-  assert.equal(an.model, "claude-opus-5-5");
-  assert.equal(an.stream, true);
-  assert.equal(an.fallbacks, "default");
-  assert.ok(String(an.beta).includes("server-side-fallback-2026-07-01"));
-  assert.equal(an.hasSchema, true);
-  assert.equal(an.effort, "medium");
-  assert.ok(an.prompt.includes("Otros participantes: Gracias, Marta"), "la transcripción no está en el prompt");
-  assert.ok(an.prompt.includes("Tú: Buenos días"));
-  assert.ok(an.prompt.includes("Plataforma: Google Meet"));
+const chatA = captured.groqChat;
+const chatOk = chatA.filter((c) => c.status === 200);
+check("sin clave de Claude, el análisis se hace gratis en Groq", () => {
+  assert.equal(captured.anthropic.length, 0);
+  assert.ok(chatOk.length >= 3, `llamadas=${chatOk.length}`);
+  for (const c of chatOk) {
+    assert.equal(c.auth, "Bearer test-groq");
+    assert.equal(c.model, "openai/gpt-oss-120b");
+    assert.equal(c.responseFormat, "json_schema");
+    assert.equal(c.strict, true);
+    assert.equal(c.reasoningEffort, "low");
+  }
 });
+check("transcripción larga: se analiza por tramos y se combina", () => {
+  const maps = chatOk.filter((c) => c.kind === "map");
+  const reduces = chatOk.filter((c) => c.kind === "reduce");
+  assert.ok(maps.length >= 2, `tramos=${maps.length}`);
+  assert.ok(reduces.length >= 1);
+  assert.ok(maps.some((c) => c.user.includes("Otros participantes: Gracias, Marta")));
+  assert.ok(maps.some((c) => c.user.includes("Tú: Buenos días")));
+  assert.ok(chatOk.at(-1).kind === "reduce" && chatOk.at(-1).user.includes("informe final de toda la reunión"));
+  assert.ok(row.analysis_parts.length >= 2 && row.analysis_parts.every(Boolean), "tramos guardados");
+});
+check("límite por minuto (429): espera y reintenta", () => assert.equal(chatA[0].status, 429));
+check("se agota el tiempo de la invocación: guarda y continúa sola", () => assert.ok(row.continuations >= 1, `continuaciones=${row.continuations}`));
 check("análisis guardado", () => {
   assert.equal(row.analysis.decisions[0], "Retrasar el lanzamiento al día 14.");
   assert.equal(row.title, "Lanzamiento de la versión 2 y presupuesto");
@@ -419,7 +446,8 @@ const afterResend = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured
 check("«Reenviar correo» envía otro correo sin repetir transcripción ni IA", () => {
   assert.equal(afterResend.resend.length, 2);
   assert.equal(afterResend.groq.length, groqA.length);
-  assert.equal(afterResend.anthropic.length, 1);
+  assert.equal(afterResend.groqChat.length, chatA.length);
+  assert.equal(afterResend.anthropic.length, 0);
 });
 
 // Ajustes
@@ -435,8 +463,15 @@ check("ajustes guardados", () => {
 });
 
 // ------------------------------------------------------------------ 4. Cerrar la pestaña a mitad de la grabación
-log("escenario: navegador sin micrófono, cerrar la pestaña grabando");
+log("escenario: con clave de Claude, navegador sin micrófono, cerrar la pestaña grabando");
 await ctx.close();
+await stopApp();
+await startApp({
+  ANTHROPIC_API_KEY: "test-anthropic",
+  ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_PORT}/anthropic`,
+  ANALYSIS_CHUNK_TOKENS: "",
+  PROCESSING_BUDGET_MS: "",
+});
 const ctxB = await launchWithExtension("b", { fakeMic: false });
 const meet2 = await ctxB.newPage();
 await meet2.goto("https://meet.google.com/xyz-abcd-efg");
@@ -460,6 +495,21 @@ const row2 = await waitFor(
 );
 const cap2 = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured`)).json();
 const groqB = cap2.groq.slice(groqA.length);
+const an = cap2.anthropic[0];
+check("con clave de Claude, el análisis lo hace Claude (una llamada, salida estructurada)", () => {
+  assert.ok(an, "no hubo llamada");
+  assert.equal(cap2.anthropic.length, 1);
+  assert.equal(cap2.groqChat.length, chatA.length, "no se usa Groq para analizar");
+  assert.equal(an.auth, "Bearer test-anthropic");
+  assert.equal(an.model, "claude-opus-5-5");
+  assert.equal(an.stream, true);
+  assert.equal(an.fallbacks, "default");
+  assert.ok(String(an.beta).includes("server-side-fallback-2026-07-01"));
+  assert.equal(an.hasSchema, true);
+  assert.equal(an.effort, "medium");
+  assert.ok(an.prompt.includes("Otros participantes: Gracias, Marta"), "la transcripción no está en el prompt");
+  assert.ok(an.prompt.includes("Plataforma: Google Meet"));
+});
 check("al cerrar la pestaña, la reunión se procesa y se envía igualmente", () => {
   assert.equal(row2.status, "done");
   assert.equal(cap2.resend.length, 3);

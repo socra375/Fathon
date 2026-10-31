@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   language        text,               -- idioma detectado / usado en la transcripción
   timezone        text,               -- zona horaria del navegador que grabó (p. ej. America/Mexico_City)
   analysis        jsonb,              -- salida estructurada de la IA
+  analysis_parts  jsonb NOT NULL DEFAULT '[]'::jsonb, -- análisis parciales por tramo (modelo gratuito)
+  continuations   integer NOT NULL DEFAULT 0,          -- veces que el proceso continuó en otra invocación
   email_to        text,
   email_id        text,
   emailed_at      timestamptz,
@@ -33,6 +35,8 @@ CREATE INDEX IF NOT EXISTS meetings_started_idx ON meetings (started_at DESC);
 -- Migraciones aditivas (para bases creadas con versiones anteriores del esquema).
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS timezone text;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS transcript_parts jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS analysis_parts jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS continuations integer NOT NULL DEFAULT 0;
 
 -- Audio en trozos de ~15 s tal como los sube la extensión. Se borran al terminar.
 -- track: 'tab' (audio de la pestaña = los demás), 'mic' (tu micrófono) o 'mix' (versión antigua, mezclado).

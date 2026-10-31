@@ -8,7 +8,7 @@ const MISSING = {
   database: "Base de datos",
   apiKey: "Clave de la extensión",
   transcription: "Transcripción (Groq o Deepgram)",
-  anthropic: "Anthropic (IA)",
+  analysis: "Análisis con IA (Claude o Groq)",
   resend: "Resend (correo)",
 };
 

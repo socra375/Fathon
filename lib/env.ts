@@ -26,6 +26,20 @@ export const env = {
   deepgramUrl: () => (read("DEEPGRAM_API_URL") ?? "https://api.deepgram.com").replace(/\/$/, ""),
   deepgramModel: () => read("DEEPGRAM_MODEL") ?? "nova-3",
 
+  /** claude (de pago, mejor calidad) o groq (gratis). Por defecto: Claude si hay clave; si no, Groq. */
+  analysisProvider: (): "claude" | "groq" | null => {
+    const explicit = read("ANALYSIS_PROVIDER");
+    if (explicit === "claude" || explicit === "groq") return explicit;
+    if (read("ANTHROPIC_API_KEY")) return "claude";
+    if (read("GROQ_API_KEY")) return "groq";
+    return null;
+  },
+  groqAnalysisModel: () => read("GROQ_ANALYSIS_MODEL") ?? "openai/gpt-oss-120b",
+  /** Tokens de transcripción por petición al modelo gratuito (su límite es ~8.000 tokens/min). */
+  analysisChunkTokens: () => Number(read("ANALYSIS_CHUNK_TOKENS")) || 3800,
+  /** Tiempo de trabajo por invocación antes de guardar el progreso y continuar en otra (Vercel corta a los 300 s). */
+  processingBudgetMs: () => Number(read("PROCESSING_BUDGET_MS")) || 240_000,
+
   anthropicKey: () => read("ANTHROPIC_API_KEY"),
   anthropicModel: () => read("ANTHROPIC_MODEL") ?? "claude-opus-5-5",
 
@@ -48,7 +62,7 @@ export function configStatus() {
     database: Boolean(env.databaseUrl()),
     apiKey: Boolean(env.apiKey()),
     transcription: Boolean(env.transcriptionProvider()),
-    anthropic: Boolean(env.anthropicKey()),
+    analysis: Boolean(env.analysisProvider()),
     resend: Boolean(env.resendKey()),
   };
 }

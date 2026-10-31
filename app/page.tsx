@@ -125,7 +125,7 @@ export default function Home() {
         </section>
       </main>
 
-      <footer className="wrap">Minuta · Transcripción con Whisper · Análisis con Claude</footer>
+      <footer className="wrap">Minuta · Transcripción con Whisper · Análisis con IA (Claude o modelo abierto gratuito)</footer>
     </>
   );
 }

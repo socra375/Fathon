@@ -47,7 +47,7 @@ export const ANALYSIS_JSON_SCHEMA = obj({
   follow_up_email: obj({ subject: str, body: str }),
 });
 
-const SYSTEM_ES = `Eres el analista de reuniones de Minuta. Recibes la transcripción automática de una reunión (con marcas de tiempo y etiquetas de hablante, que puede contener errores de reconocimiento) y produces un informe útil para la persona que grabó la reunión y necesita actuar después.
+export const SYSTEM_ES = `Eres el analista de reuniones de Minuta. Recibes la transcripción automática de una reunión (con marcas de tiempo y etiquetas de hablante, que puede contener errores de reconocimiento) y produces un informe útil para la persona que grabó la reunión y necesita actuar después.
 
 Etiquetas de hablante:
 - "Tú" es la persona que grabó la reunión (su micrófono).
@@ -67,7 +67,7 @@ Reglas:
 - "follow_up_email": correo de seguimiento listo para enviar a los participantes, en tono profesional y cercano, con resumen, acuerdos y próximos pasos.
 - Si la transcripción es muy corta o no tiene contenido útil, dilo en "summary" y deja las listas vacías.`;
 
-const SYSTEM_EN = SYSTEM_ES.replace("Escribe todo el informe en español, aunque la reunión sea en otro idioma.", "Write the entire report in English, even if the meeting was in another language.");
+export const SYSTEM_EN = SYSTEM_ES.replace("Escribe todo el informe en español, aunque la reunión sea en otro idioma.", "Write the entire report in English, even if the meeting was in another language.");
 
 export interface AnalyzeInput {
   transcriptText: string;
@@ -81,7 +81,12 @@ export interface AnalyzeInput {
 
 export class AnalysisError extends Error {}
 
-export function buildPrompt(input: AnalyzeInput): string {
+export function systemPrompt(lang: ReportLanguage): string {
+  return lang === "en" ? SYSTEM_EN : SYSTEM_ES;
+}
+
+/** Cabecera con los datos de la reunión (se repite en cada tramo del análisis gratuito). */
+export function meetingHeader(input: AnalyzeInput): string {
   const talk = input.talk
     .map((t) => `- ${t.label}: ${t.pct}% del tiempo de palabra (${t.turns} intervenciones)`)
     .join("\n");
@@ -94,6 +99,27 @@ export function buildPrompt(input: AnalyzeInput): string {
     "Tiempo de palabra medido:",
     talk || "- (sin datos)",
     "</reunion>",
+  ].join("\n");
+}
+
+/** Parsea y valida la salida JSON de un modelo. */
+export function parseAnalysis(text: string): Analysis {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new AnalysisError("La IA devolvió un JSON no válido.");
+  }
+  const result = AnalysisSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new AnalysisError(`El análisis no cumple el esquema: ${result.error.issues[0]?.message ?? ""}`);
+  }
+  return result.data;
+}
+
+export function buildPrompt(input: AnalyzeInput): string {
+  return [
+    meetingHeader(input),
     "",
     "<transcripcion>",
     input.transcriptText,
@@ -103,7 +129,8 @@ export function buildPrompt(input: AnalyzeInput): string {
   ].join("\n");
 }
 
-export async function analyze(input: AnalyzeInput): Promise<Analysis> {
+/** Análisis con Claude (de pago): una sola llamada con toda la transcripción. */
+export async function analyzeWithClaude(input: AnalyzeInput): Promise<Analysis> {
   const apiKey = env.anthropicKey();
   if (!apiKey) throw new AnalysisError("Falta ANTHROPIC_API_KEY");
   const client = new Anthropic({ apiKey, timeout: 280_000, maxRetries: 2 });
@@ -120,7 +147,7 @@ export async function analyze(input: AnalyzeInput): Promise<Analysis> {
       effort: "medium",
       format: { type: "json_schema", schema: ANALYSIS_JSON_SCHEMA },
     },
-    system: input.reportLanguage === "en" ? SYSTEM_EN : SYSTEM_ES,
+    system: systemPrompt(input.reportLanguage),
     messages: [{ role: "user", content: buildPrompt(input) }],
   });
   const message = await stream.finalMessage();
@@ -135,17 +162,7 @@ export async function analyze(input: AnalyzeInput): Promise<Analysis> {
     .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
     .map((b) => b.text)
     .join("");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new AnalysisError("La IA devolvió un JSON no válido.");
-  }
-  const result = AnalysisSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new AnalysisError(`El análisis no cumple el esquema: ${result.error.issues[0]?.message ?? ""}`);
-  }
-  return result.data;
+  return parseAnalysis(text);
 }
 
 /** Informe mínimo cuando no se detectó voz (no se gasta una llamada a la IA). */

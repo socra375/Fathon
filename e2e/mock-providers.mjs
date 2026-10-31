@@ -7,7 +7,8 @@ import path from "node:path";
 
 const PORT = Number(process.env.MOCK_PORT || 4010);
 const OUT = process.env.MOCK_OUT || path.resolve("e2e/.tmp");
-const captured = { deepgram: [], groq: [], anthropic: [], resend: [] };
+const captured = { deepgram: [], groq: [], groqChat: [], anthropic: [], resend: [] };
+let groqChat429Sent = false;
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -24,6 +25,33 @@ function probeDuration(file) {
   if (!times.length) return 0;
   const [, h, m, s] = times[times.length - 1];
   return Number(h) * 3600 + Number(m) * 60 + Number(s);
+}
+
+function fullAnalysis(prompt) {
+  const lines = (prompt.match(/\[\d\d:\d\d\]/g) || []).length;
+  const analysis = {
+    title: "Lanzamiento de la versión 2 y presupuesto",
+    summary: `Se revisó el lanzamiento de la versión 2 (${lines} intervenciones). Se acordó retrasarlo una semana, al día 14, para completar las pruebas de pago. Carlos prepara el plan de pruebas para el viernes. Queda pendiente el presupuesto de anuncios.`,
+    key_points: ["El lanzamiento pasa al día 14.", "Faltan las pruebas de pago."],
+    topics: [
+      { title: "Fecha de lanzamiento", start: "00:00", summary: "Se propone retrasar una semana." },
+      { title: "Plan de pruebas", start: "00:20", summary: "Carlos se encarga." },
+    ],
+    decisions: ["Retrasar el lanzamiento al día 14."],
+    action_items: [{ owner: "Carlos", task: "Preparar el plan de pruebas de pago", due: "viernes" }],
+    open_questions: ["¿Cuál será el presupuesto de anuncios?"],
+    risks: ["Las pruebas de pago podrían retrasar más el lanzamiento."],
+    speakers: [
+      { label: "Tú", likely_name: "", contribution: "Dirige la reunión y fija la fecha." },
+      { label: "Otros participantes", likely_name: "", contribution: "Carlos propone el retraso y asume el plan de pruebas." },
+    ],
+    sentiment: { overall: "positive", explanation: "Reunión colaborativa con acuerdos rápidos." },
+    follow_up_email: {
+      subject: "Resumen: lanzamiento v2",
+      body: "Hola a todos,\n\nAcordamos mover el lanzamiento al día 14. Carlos enviará el plan de pruebas el viernes.\n\nUn saludo.",
+    },
+  };
+  return analysis;
 }
 
 function sse(res, events) {
@@ -127,6 +155,46 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---------------- Groq chat (modelo abierto gratuito, API compatible con OpenAI)
+  if (req.method === "POST" && url.pathname === "/groq/openai/v1/chat/completions") {
+    const j = JSON.parse(body.toString("utf8"));
+    const user = String(j.messages?.find((m) => m.role === "user")?.content ?? "");
+    const part = /PARTE (\d+) de (\d+)/.exec(user);
+    const kind = part ? "map" : /analisis_parciales/.test(user) ? "reduce" : "single";
+    // La primera petición recibe un 429 para probar la espera por límite de tokens por minuto.
+    if (!groqChat429Sent) {
+      groqChat429Sent = true;
+      captured.groqChat.push({ kind, status: 429 });
+      res.writeHead(429, { "Content-Type": "application/json", "retry-after": "1", "x-ratelimit-reset-tokens": "1s" });
+      res.end(JSON.stringify({ error: { message: "Rate limit reached for tokens per minute" } }));
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+    captured.groqChat.push({
+      kind,
+      status: 200,
+      auth: req.headers.authorization,
+      model: j.model,
+      responseFormat: j.response_format?.type,
+      strict: j.response_format?.json_schema?.strict,
+      reasoningEffort: j.reasoning_effort,
+      maxTokens: j.max_completion_tokens,
+      user: user.slice(0, 4000),
+    });
+    const analysis = fullAnalysis(user);
+    const out =
+      kind === "map"
+        ? { ...analysis, title: `Parte ${part[1]}`, summary: `Resumen de la parte ${part[1]}.`, follow_up_email: { subject: "", body: "" } }
+        : analysis;
+    res.writeHead(200, {
+      "Content-Type": "application/json",
+      "x-ratelimit-remaining-tokens": "7000",
+      "x-ratelimit-reset-tokens": "1s",
+    });
+    res.end(JSON.stringify({ id: "chatcmpl-mock", choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(out) }, finish_reason: "stop" }] }));
+    return;
+  }
+
   // ---------------- Anthropic Messages (streaming)
   if (req.method === "POST" && url.pathname === "/anthropic/v1/messages") {
     const reqJson = JSON.parse(body.toString("utf8"));
@@ -143,30 +211,7 @@ const server = http.createServer(async (req, res) => {
       prompt: reqJson.messages?.[0]?.content,
       system: typeof reqJson.system === "string" ? reqJson.system.slice(0, 80) : null,
     });
-    const prompt = String(reqJson.messages?.[0]?.content ?? "");
-    const lines = (prompt.match(/\[\d\d:\d\d\]/g) || []).length;
-    const analysis = {
-      title: "Lanzamiento de la versión 2 y presupuesto",
-      summary: `Se revisó el lanzamiento de la versión 2 (${lines} intervenciones). Se acordó retrasarlo una semana, al día 14, para completar las pruebas de pago. Carlos prepara el plan de pruebas para el viernes. Queda pendiente el presupuesto de anuncios.`,
-      key_points: ["El lanzamiento pasa al día 14.", "Faltan las pruebas de pago."],
-      topics: [
-        { title: "Fecha de lanzamiento", start: "00:00", summary: "Se propone retrasar una semana." },
-        { title: "Plan de pruebas", start: "00:20", summary: "Carlos se encarga." },
-      ],
-      decisions: ["Retrasar el lanzamiento al día 14."],
-      action_items: [{ owner: "Carlos", task: "Preparar el plan de pruebas de pago", due: "viernes" }],
-      open_questions: ["¿Cuál será el presupuesto de anuncios?"],
-      risks: ["Las pruebas de pago podrían retrasar más el lanzamiento."],
-      speakers: [
-        { label: "Tú", likely_name: "", contribution: "Dirige la reunión y fija la fecha." },
-        { label: "Otros participantes", likely_name: "", contribution: "Carlos propone el retraso y asume el plan de pruebas." },
-      ],
-      sentiment: { overall: "positive", explanation: "Reunión colaborativa con acuerdos rápidos." },
-      follow_up_email: {
-        subject: "Resumen: lanzamiento v2",
-        body: "Hola a todos,\n\nAcordamos mover el lanzamiento al día 14. Carlos enviará el plan de pruebas el viernes.\n\nUn saludo.",
-      },
-    };
+    const analysis = fullAnalysis(String(reqJson.messages?.[0]?.content ?? ""));
     const text = JSON.stringify(analysis);
     const parts = text.match(/.{1,200}/gs) || [text];
     const msg = {

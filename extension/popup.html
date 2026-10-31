@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Minuta</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <span class="dot"></span><strong>Minuta</strong>
+  </header>
+  <section id="status" class="card"><p class="muted">Comprobando conexión…</p></section>
+  <section class="card">
+    <label class="row">
+      <input type="checkbox" id="includeMic" checked>
+      <span>Incluir mi micrófono en la grabación</span>
+    </label>
+    <p class="muted small">Para grabar, abre una reunión de Google Meet, Teams o Zoom en el navegador y pulsa el botón «Grabar esta reunión».</p>
+  </section>
+  <a id="dashboard" class="btn" href="#" target="_blank" rel="noopener">Abrir mi panel</a>
+  <details>
+    <summary>Conexión avanzada</summary>
+    <form id="adv">
+      <label>Servidor<input id="serverUrl" type="url" placeholder="https://tu-app.vercel.app"></label>
+      <label>Clave de la extensión<input id="apiKey" type="password" autocomplete="off"></label>
+      <button type="submit" class="btn secondary">Guardar</button>
+      <p id="saved" class="muted small" hidden>Guardado.</p>
+    </form>
+  </details>
+  <script src="popup.js" type="module"></script>
+</body>
+</html>

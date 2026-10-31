@@ -1,0 +1,39 @@
+{
+  "name": "minuta",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minuta: transcriptor y analista de reuniones con IA para Google Meet, Teams y Zoom web.",
+  "scripts": {
+    "embed": "node scripts/embed-assets.mjs",
+    "predev": "node scripts/embed-assets.mjs",
+    "dev": "next dev",
+    "prebuild": "node scripts/embed-assets.mjs",
+    "build": "next build",
+    "start": "next start",
+    "pretypecheck": "node scripts/embed-assets.mjs",
+    "typecheck": "tsc --noEmit",
+    "pretest": "node scripts/embed-assets.mjs",
+    "test": "vitest run",
+    "e2e": "node e2e/run-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.3.0",
+    "jszip": "^3.10.2",
+    "next": "^16.4.3",
+    "pg": "^8.23.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "5.9",
+    "vitest": "^5.0.5"
+  }
+}

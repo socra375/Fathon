@@ -37,3 +37,20 @@ describe("format", () => {
     expect(escapeHtml(`<a href="x">'&'</a>`)).toBe("&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
   });
 });
+
+describe("labels", () => {
+  it("uses the utterance label and keeps legacy numbering", () => {
+    expect(transcriptToText([{ start: 3, end: 4, speaker: 0, text: "Hola", label: "Tú" }])).toBe("[00:03] Tú: Hola");
+    expect(transcriptToText([{ start: 3, end: 4, speaker: 2, text: "Hola" }])).toBe("[00:03] Hablante 3: Hola");
+  });
+
+  it("orders interleaved tracks by time before merging", () => {
+    const merged = mergeUtterances([
+      { start: 10, end: 12, speaker: 1, text: "B", label: "Otros participantes" },
+      { start: 0, end: 4, speaker: 0, text: "A", label: "Tú" },
+      { start: 4.5, end: 6, speaker: 0, text: "A2", label: "Tú" },
+    ]);
+    expect(merged.map((u) => u.text)).toEqual(["A A2", "B"]);
+    expect(talkShares(merged).map((t) => t.label)).toEqual(["Tú", "Otros participantes"]);
+  });
+});

@@ -90,7 +90,13 @@ async function handle(msg, sender) {
       return { ok: true, id: r.body.id };
     }
     case "session:chunk": {
-      const r = await api(`/api/sessions/${msg.id}/chunks?seq=${msg.seq}`, {
+      const q = new URLSearchParams({
+        seq: String(msg.seq),
+        track: msg.track || "mix",
+        seg: String(msg.seg || 0),
+        segStart: String(Math.max(0, Math.round(msg.segStart || 0))),
+      });
+      const r = await api(`/api/sessions/${msg.id}/chunks?${q}`, {
         method: "POST",
         headers: { "Content-Type": "audio/webm" },
         body: b64ToBytes(msg.data),

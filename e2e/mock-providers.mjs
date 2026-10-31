@@ -7,7 +7,7 @@ import path from "node:path";
 
 const PORT = Number(process.env.MOCK_PORT || 4010);
 const OUT = process.env.MOCK_OUT || path.resolve("e2e/.tmp");
-const captured = { deepgram: [], anthropic: [], resend: [] };
+const captured = { deepgram: [], groq: [], anthropic: [], resend: [] };
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -75,6 +75,58 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---------------- Groq (Whisper, API compatible con OpenAI, multipart/form-data)
+  if (req.method === "POST" && url.pathname === "/groq/openai/v1/audio/transcriptions") {
+    const form = await new Request("http://mock/", {
+      method: "POST",
+      headers: { "content-type": req.headers["content-type"] },
+      body,
+    }).formData();
+    const file = form.get("file");
+    const name = file && typeof file === "object" ? file.name : "";
+    const bytes = file && typeof file === "object" ? Buffer.from(await file.arrayBuffer()) : Buffer.alloc(0);
+    const out = path.join(OUT, `groq-${captured.groq.length}-${name}`);
+    writeFileSync(out, bytes);
+    const m = /^(tab|mic|mix)-(\d+)\.webm$/.exec(name);
+    const track = m ? m[1] : "?";
+    const seg = m ? Number(m[2]) : -1;
+    captured.groq.push({
+      auth: req.headers.authorization,
+      name,
+      track,
+      seg,
+      model: form.get("model"),
+      responseFormat: form.get("response_format"),
+      granularity: form.get("timestamp_granularities[]"),
+      language: form.get("language"),
+      bytes: bytes.length,
+      file: out,
+      duration: probeDuration(out),
+    });
+    const LINES = {
+      mic: [
+        "Buenos días a todos. Hoy revisamos el lanzamiento de la versión dos y el presupuesto de marketing.",
+        "De acuerdo, lo movemos al día catorce. Carlos, ¿puedes preparar el plan de pruebas para el viernes?",
+      ],
+      tab: [
+        "Gracias, Marta. Propongo retrasar el lanzamiento una semana porque faltan las pruebas de pago.",
+        "Sí, lo tendré el viernes. Queda pendiente decidir el presupuesto de anuncios.",
+      ],
+    };
+    const text = (LINES[track] || ["(sin texto)"])[Math.min(seg, 1)] || "(sin texto)";
+    const segments =
+      track === "mic"
+        ? [
+            { id: 0, start: 0.5, end: 4.5, text: ` ${text}`, avg_logprob: -0.2, no_speech_prob: 0.02, compression_ratio: 1.3 },
+            // Alucinación típica de Whisper sobre silencio: debe descartarse.
+            { id: 1, start: 12, end: 15, text: " Subtítulos realizados por la comunidad de Amara.org", avg_logprob: -1.4, no_speech_prob: 0.92, compression_ratio: 1.1 },
+          ]
+        : [{ id: 0, start: 6, end: 11, text: ` ${text}`, avg_logprob: -0.25, no_speech_prob: 0.03, compression_ratio: 1.4 }];
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ task: "transcribe", language: "spanish", duration: probeDuration(out), text, segments }));
+    return;
+  }
+
   // ---------------- Anthropic Messages (streaming)
   if (req.method === "POST" && url.pathname === "/anthropic/v1/messages") {
     const reqJson = JSON.parse(body.toString("utf8"));
@@ -106,8 +158,8 @@ const server = http.createServer(async (req, res) => {
       open_questions: ["¿Cuál será el presupuesto de anuncios?"],
       risks: ["Las pruebas de pago podrían retrasar más el lanzamiento."],
       speakers: [
-        { label: "Hablante 1", likely_name: "Marta", contribution: "Dirige la reunión y fija la fecha." },
-        { label: "Hablante 2", likely_name: "Carlos", contribution: "Propone el retraso y asume el plan de pruebas." },
+        { label: "Tú", likely_name: "", contribution: "Dirige la reunión y fija la fecha." },
+        { label: "Otros participantes", likely_name: "", contribution: "Carlos propone el retraso y asume el plan de pruebas." },
       ],
       sentiment: { overall: "positive", explanation: "Reunión colaborativa con acuerdos rápidos." },
       follow_up_email: {

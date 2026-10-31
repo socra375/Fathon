@@ -1,12 +1,15 @@
 // Minuta · script de contenido
 // Inserta el botón flotante en Google Meet, Microsoft Teams y Zoom (web),
-// graba el audio de la pestaña + tu micrófono y lo envía al servidor en fragmentos.
+// graba por separado el audio de la pestaña (los demás) y tu micrófono (tú), y lo envía
+// al servidor en fragmentos de 15 s. Cada ~20 min empieza un segmento nuevo para que cada
+// archivo de audio sea pequeño (el plan gratuito de transcripción admite hasta 25 MB).
 (() => {
   if (window.__minutaLoaded) return;
   window.__minutaLoaded = true;
 
   const CHUNK_MS = 15000;
-  const BITRATE = 48000;
+  const BITRATE = 32000; // voz en Opus: buena calidad y ~14 MB por hora y pista
+  const DEFAULT_SEGMENT_MS = 20 * 60 * 1000;
   const NOTICE =
     "Aviso: estoy grabando esta reunión con Minuta para generar notas y un resumen. Si alguien no está de acuerdo, dímelo y detengo la grabación.";
 
@@ -56,11 +59,11 @@
     state: "idle", // idle | starting | recording | finishing | sent | error
     id: null,
     startedAt: 0,
-    recorder: null,
+    segStartMs: 0,
+    tracks: [], // grabadoras por pista: "tab" (los demás) y "mic" (tú)
+    rotateTimer: null,
     display: null,
     mic: null,
-    ctx: null,
-    seq: 0,
     queue: [],
     pumping: false,
     unstable: false,
@@ -72,7 +75,15 @@
     const data = await blobToBase64(item.blob);
     const delays = [1000, 2000, 4000, 8000, 15000];
     for (let attempt = 0; ; attempt++) {
-      const r = await send({ type: "session:chunk", id: item.id, seq: item.seq, data });
+      const r = await send({
+        type: "session:chunk",
+        id: item.id,
+        track: item.track,
+        seq: item.seq,
+        seg: item.seg,
+        segStart: item.segStart,
+        data,
+      });
       if (r.ok || r.status === 409 || r.status === 404 || r.status === 401) {
         rec.unstable = false;
         return;
@@ -106,16 +117,57 @@
 
   function stopTracks() {
     for (const s of [rec.display, rec.mic]) if (s) s.getTracks().forEach((t) => t.stop());
-    if (rec.ctx) rec.ctx.close().catch(() => {});
-    rec.display = rec.mic = rec.ctx = null;
+    rec.display = rec.mic = null;
   }
 
-  async function includeMic() {
+  async function getOption(key, fallback) {
     try {
-      const { includeMic } = await chrome.storage.local.get("includeMic");
-      return includeMic !== false;
+      const v = (await chrome.storage.local.get(key))[key];
+      return v === undefined ? fallback : v;
     } catch {
-      return true;
+      return fallback;
+    }
+  }
+
+  const MIME = () =>
+    MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
+
+  /** Graba una pista en segmentos WebM independientes, cada uno troceado cada 15 s. */
+  function createTrackRecorder(name, stream, sessionId) {
+    const t = { name, seg: -1, seq: 0, recorder: null };
+    t.startSegment = () => {
+      t.seg += 1;
+      const seg = t.seg;
+      const segStart = rec.segStartMs;
+      const r = new MediaRecorder(stream, { mimeType: MIME(), audioBitsPerSecond: BITRATE });
+      r.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          rec.queue.push({ id: sessionId, track: name, seg, segStart, seq: t.seq++, blob: ev.data });
+          pump();
+        }
+      };
+      r.start(CHUNK_MS);
+      const previous = t.recorder;
+      t.recorder = r;
+      return previous;
+    };
+    t.stopRecorder = (r) =>
+      new Promise((resolve) => {
+        if (!r || r.state === "inactive") return resolve();
+        r.addEventListener("stop", resolve, { once: true });
+        r.stop();
+      });
+    t.stop = () => t.stopRecorder(t.recorder);
+    return t;
+  }
+
+  /** Empieza un segmento nuevo en todas las pistas a la vez (mantiene alineados los tiempos). */
+  function rotateSegments() {
+    if (rec.state !== "recording") return;
+    rec.segStartMs = Date.now() - rec.startedAt;
+    for (const t of rec.tracks) {
+      const previous = t.startSegment();
+      t.stopRecorder(previous);
     }
   }
 
@@ -159,7 +211,7 @@
     rec.display = display;
 
     let micWarning = "";
-    if (await includeMic()) {
+    if (await getOption("includeMic", true)) {
       try {
         rec.mic = await navigator.mediaDevices.getUserMedia({
           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -168,14 +220,6 @@
         micWarning = "No se pudo usar tu micrófono: solo se grabará a los demás.";
       }
     }
-
-    const ctx = new AudioContext();
-    rec.ctx = ctx;
-    const dest = ctx.createMediaStreamDestination();
-    ctx.createMediaStreamSource(new MediaStream([tabTrack])).connect(dest);
-    if (rec.mic) ctx.createMediaStreamSource(rec.mic).connect(dest);
-    // La pestaña sigue sonando con normalidad (suppressLocalAudioPlayback: false).
-    await ctx.resume().catch(() => {});
 
     let timezone = "";
     try {
@@ -188,26 +232,23 @@
       return;
     }
 
-    const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm";
-    const recorder = new MediaRecorder(dest.stream, { mimeType: mime, audioBitsPerSecond: BITRATE });
     rec.id = s.id;
-    rec.seq = 0;
     rec.queue = [];
-    rec.recorder = recorder;
     rec.startedAt = Date.now();
-    const sessionId = s.id;
-    recorder.ondataavailable = (ev) => {
-      if (ev.data && ev.data.size > 0) {
-        rec.queue.push({ id: sessionId, seq: rec.seq++, blob: ev.data });
-        pump();
-      }
-    };
+    rec.segStartMs = 0;
+    // La pestaña sigue sonando con normalidad (suppressLocalAudioPlayback: false).
+    rec.tracks = [createTrackRecorder("tab", new MediaStream([tabTrack]), s.id)];
+    if (rec.mic) rec.tracks.push(createTrackRecorder("mic", rec.mic, s.id));
+    for (const t of rec.tracks) t.startSegment();
+
+    const segmentMs = Number(await getOption("segmentMs", DEFAULT_SEGMENT_MS)) || DEFAULT_SEGMENT_MS;
+    rec.rotateTimer = setInterval(rotateSegments, Math.max(10000, segmentMs));
+
     // Si el usuario pulsa «Dejar de compartir» en la barra de Chrome, se termina igual.
     tabTrack.addEventListener("ended", () => finish());
     const v = display.getVideoTracks()[0];
     if (v) v.addEventListener("ended", () => finish());
 
-    recorder.start(CHUNK_MS);
     setState("recording", micWarning);
     rec.timer = setInterval(render, 1000);
   }
@@ -216,18 +257,13 @@
     if (rec.state !== "recording") return;
     setState("finishing", "Subiendo el audio…");
     clearInterval(rec.timer);
+    clearInterval(rec.rotateTimer);
     const durationSec = Math.round((Date.now() - rec.startedAt) / 1000);
-    const recorder = rec.recorder;
-    if (recorder && recorder.state !== "inactive") {
-      await new Promise((resolve) => {
-        recorder.addEventListener("stop", resolve, { once: true });
-        recorder.stop();
-      });
-    }
+    await Promise.all(rec.tracks.map((t) => t.stop()));
     stopTracks();
     await drain();
     const r = await send({ type: "session:finish", id: rec.id, durationSec });
-    rec.recorder = null;
+    rec.tracks = [];
     if (!r.ok) {
       setState("error", `El audio se subió, pero no se pudo cerrar la grabación: ${r.error}. Puedes procesarla desde el panel.`);
       return;
@@ -241,9 +277,11 @@
   // Cierre de pestaña o navegación fuera de la reunión.
   window.addEventListener("pagehide", () => {
     if (rec.state !== "recording" || !rec.id) return;
-    try {
-      rec.recorder && rec.recorder.state !== "inactive" && rec.recorder.requestData();
-    } catch {}
+    for (const t of rec.tracks) {
+      try {
+        t.recorder && t.recorder.state !== "inactive" && t.recorder.requestData();
+      } catch {}
+    }
     send({ type: "session:abandon", id: rec.id, durationSec: Math.round((Date.now() - rec.startedAt) / 1000) });
   });
 

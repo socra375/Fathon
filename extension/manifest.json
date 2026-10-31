@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Minuta — notas de reuniones con IA",
   "short_name": "Minuta",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Graba tus reuniones de Google Meet, Microsoft Teams y Zoom (web), y recibe por correo la transcripción, el resumen y el análisis.",
   "minimum_chrome_version": "116",
   "permissions": ["storage"],

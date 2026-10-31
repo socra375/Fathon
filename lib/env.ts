@@ -10,6 +10,18 @@ export const env = {
   apiKey: () => read("MINUTA_API_KEY"),
   dashboardPassword: () => read("DASHBOARD_PASSWORD") ?? read("MINUTA_API_KEY"),
 
+  /** groq (gratis, Whisper) o deepgram (de pago, distingue hablantes). Por defecto: el que tenga clave, Groq primero. */
+  transcriptionProvider: (): "groq" | "deepgram" | null => {
+    const explicit = read("TRANSCRIPTION_PROVIDER");
+    if (explicit === "groq" || explicit === "deepgram") return explicit;
+    if (read("GROQ_API_KEY")) return "groq";
+    if (read("DEEPGRAM_API_KEY")) return "deepgram";
+    return null;
+  },
+  groqKey: () => read("GROQ_API_KEY"),
+  groqUrl: () => (read("GROQ_API_URL") ?? "https://api.groq.com").replace(/\/$/, ""),
+  groqModel: () => read("GROQ_MODEL") ?? "whisper-large-v3-turbo",
+
   deepgramKey: () => read("DEEPGRAM_API_KEY"),
   deepgramUrl: () => (read("DEEPGRAM_API_URL") ?? "https://api.deepgram.com").replace(/\/$/, ""),
   deepgramModel: () => read("DEEPGRAM_MODEL") ?? "nova-3",
@@ -35,7 +47,7 @@ export function configStatus() {
   return {
     database: Boolean(env.databaseUrl()),
     apiKey: Boolean(env.apiKey()),
-    deepgram: Boolean(env.deepgramKey()),
+    transcription: Boolean(env.transcriptionProvider()),
     anthropic: Boolean(env.anthropicKey()),
     resend: Boolean(env.resendKey()),
   };

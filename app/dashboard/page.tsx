@@ -22,7 +22,7 @@ interface Row {
 const CHECK_LABELS: Record<string, string> = {
   database: "Base de datos",
   apiKey: "Clave de la extensión",
-  deepgram: "Transcripción (Deepgram)",
+  transcription: "Transcripción (Groq gratis o Deepgram)",
   anthropic: "IA (Anthropic)",
   resend: "Correo (Resend)",
 };

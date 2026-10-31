@@ -1,8 +1,10 @@
 export interface Utterance {
-  start: number; // segundos
+  start: number; // segundos desde el inicio de la reunión
   end: number;
-  speaker: number; // 0-based
+  speaker: number; // identificador numérico estable dentro de la reunión
   text: string;
+  /** Nombre que se muestra («Tú», «Otros participantes», «Participante 2»…). */
+  label?: string;
 }
 
 export function clock(totalSec: number): string {
@@ -19,16 +21,22 @@ export function speakerLabel(speaker: number, lang: "es" | "en" = "es"): string 
   return `${lang === "en" ? "Speaker" : "Hablante"} ${speaker + 1}`;
 }
 
-/** Une frases consecutivas del mismo hablante para que la transcripción sea legible. */
+/** Etiqueta visible de una intervención (las transcripciones antiguas no traen `label`). */
+export function labelOf(u: Pick<Utterance, "speaker" | "label">, lang: "es" | "en" = "es"): string {
+  return u.label || speakerLabel(u.speaker, lang);
+}
+
+/** Ordena por tiempo y une frases consecutivas del mismo hablante para que se lea bien. */
 export function mergeUtterances(utts: Utterance[], maxGapSec = 2): Utterance[] {
+  const sorted = [...utts].sort((a, b) => a.start - b.start || a.speaker - b.speaker);
   const out: Utterance[] = [];
-  for (const u of utts) {
+  for (const u of sorted) {
     const text = u.text.trim();
     if (!text) continue;
     const last = out[out.length - 1];
     if (last && last.speaker === u.speaker && u.start - last.end <= maxGapSec) {
       last.text = `${last.text} ${text}`;
-      last.end = u.end;
+      last.end = Math.max(last.end, u.end);
     } else {
       out.push({ ...u, text });
     }
@@ -37,11 +45,12 @@ export function mergeUtterances(utts: Utterance[], maxGapSec = 2): Utterance[] {
 }
 
 export function transcriptToText(utts: Utterance[], lang: "es" | "en" = "es"): string {
-  return utts.map((u) => `[${clock(u.start)}] ${speakerLabel(u.speaker, lang)}: ${u.text}`).join("\n");
+  return utts.map((u) => `[${clock(u.start)}] ${labelOf(u, lang)}: ${u.text}`).join("\n");
 }
 
 export interface TalkShare {
   speaker: number;
+  label: string;
   seconds: number;
   pct: number;
   turns: number;
@@ -52,7 +61,7 @@ export interface TalkShare {
 export function talkShares(utts: Utterance[]): TalkShare[] {
   const by = new Map<number, TalkShare>();
   for (const u of utts) {
-    const cur = by.get(u.speaker) ?? { speaker: u.speaker, seconds: 0, pct: 0, turns: 0, words: 0 };
+    const cur = by.get(u.speaker) ?? { speaker: u.speaker, label: labelOf(u), seconds: 0, pct: 0, turns: 0, words: 0 };
     cur.seconds += Math.max(0, u.end - u.start);
     cur.turns += 1;
     cur.words += u.text.split(/\s+/).filter(Boolean).length;

@@ -25,7 +25,7 @@ export default function Home() {
             <h1>Termina la reunión. El resumen ya está en tu correo.</h1>
             <p className="lead">
               Minuta graba tus reuniones de Google Meet, Microsoft Teams y Zoom desde el navegador, las transcribe
-              separando a cada persona y te envía un informe con resumen, decisiones, tareas y análisis de la
+              separando tu voz de la de los demás y te envía un informe con resumen, decisiones, tareas y análisis de la
               conversación.
             </p>
             <div className="cta">
@@ -56,13 +56,13 @@ export default function Home() {
               <li>Sin asignar — revisar la página de preguntas frecuentes</li>
             </ul>
             <div style={{ marginTop: 14, fontSize: 13 }}>
-              <div>Hablante 1 · 46%</div>
+              <div>Tú · 46%</div>
               <div className="bar">
                 <span style={{ width: "46%" }} />
               </div>
-              <div>Hablante 2 · 31%</div>
+              <div>Otros participantes · 54%</div>
               <div className="bar">
-                <span style={{ width: "31%" }} />
+                <span style={{ width: "54%" }} />
               </div>
             </div>
           </div>
@@ -83,8 +83,8 @@ export default function Home() {
               <div className="num">2</div>
               <h3>Termina y envía</h3>
               <p>
-                Al acabar pulsas «Terminar y enviar». El audio se transcribe distinguiendo a cada participante, en
-                español, inglés o mezclados.
+                Al acabar pulsas «Terminar y enviar». Tu voz y la de los demás se graban por separado y se
+                transcriben gratis, en español, inglés o mezclados.
               </p>
             </div>
             <div className="feature">
@@ -125,7 +125,7 @@ export default function Home() {
         </section>
       </main>
 
-      <footer className="wrap">Minuta · Transcripción con Deepgram · Análisis con Claude</footer>
+      <footer className="wrap">Minuta · Transcripción con Whisper · Análisis con Claude</footer>
     </>
   );
 }

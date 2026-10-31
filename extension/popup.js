@@ -7,7 +7,7 @@ function esc(s) {
 const MISSING = {
   database: "Base de datos",
   apiKey: "Clave de la extensión",
-  deepgram: "Deepgram (transcripción)",
+  transcription: "Transcripción (Groq o Deepgram)",
   anthropic: "Anthropic (IA)",
   resend: "Resend (correo)",
 };

@@ -126,8 +126,9 @@ const appEnv = {
   APP_URL: APP,
   EMAIL_TO,
   EMAIL_FROM: "Minuta <onboarding@resend.dev>",
-  DEEPGRAM_API_KEY: "test-deepgram",
-  DEEPGRAM_API_URL: `http://127.0.0.1:${MOCK_PORT}/deepgram`,
+  // Transcripción gratuita (Whisper en Groq). Sin clave de Deepgram, se usa Groq.
+  GROQ_API_KEY: "test-groq",
+  GROQ_API_URL: `http://127.0.0.1:${MOCK_PORT}/groq`,
   ANTHROPIC_API_KEY: "test-anthropic",
   ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_PORT}/anthropic`,
   RESEND_API_KEY: "test-resend",
@@ -238,6 +239,8 @@ let sw = ctx.serviceWorkers()[0];
 if (!sw) sw = await ctx.waitForEvent("serviceworker", { timeout: 15000 });
 const extId = new URL(sw.url()).host;
 log("extensión cargada", extId);
+// Segmentos de 20 s (en vez de 20 min) para probar la rotación dentro de una grabación de 40 s.
+await sw.evaluate(() => chrome.storage.local.set({ segmentMs: 20000 }));
 
 // Popup: estado de conexión
 const popup = await ctx.newPage();
@@ -295,18 +298,27 @@ const leftover = (await db.query("SELECT count(*)::int AS n FROM audio_chunks WH
 check("no quedan fragmentos de audio en la base de datos", () => assert.equal(leftover, 0));
 check("duración registrada ≈ tiempo grabado", () => assert.ok(Math.abs(row.duration_sec - RECORD_SECONDS) <= 8, `duration=${row.duration_sec}`));
 
-const dg = captured.deepgram[0];
-check("Deepgram recibe el audio con la configuración correcta", () => {
-  assert.ok(dg, "no hubo llamada");
-  assert.equal(dg.auth, "Token test-deepgram");
-  assert.equal(dg.contentType, "audio/webm");
-  assert.equal(dg.query.model, "nova-3");
-  assert.equal(dg.query.diarize, "true");
-  assert.equal(dg.query.language, "multi");
+const groqA = captured.groq;
+const micCalls = groqA.filter((g) => g.track === "mic");
+const tabCalls = groqA.filter((g) => g.track === "tab");
+check("Groq (Whisper gratis) recibe cada pista y segmento por separado", () => {
+  assert.ok(groqA.length >= 4, `llamadas=${groqA.length}`);
+  for (const g of groqA) {
+    assert.equal(g.auth, "Bearer test-groq");
+    assert.equal(g.model, "whisper-large-v3-turbo");
+    assert.equal(g.responseFormat, "verbose_json");
+    assert.equal(g.granularity, "segment");
+    assert.equal(g.language, null, "con idioma «detectar» no se fuerza el idioma");
+  }
+  assert.ok(micCalls.length >= 2 && tabCalls.length >= 2, `mic=${micCalls.length} tab=${tabCalls.length}`);
+  assert.deepEqual([...new Set(tabCalls.map((g) => g.seg))].slice(0, 2), [0, 1], "la grabación rota de segmento");
 });
-check("el audio enviado es un WebM válido de la duración esperada", () =>
-  assert.ok(dg.duration >= RECORD_SECONDS - 6, `ffprobe=${dg.duration}s`),
-);
+check("cada segmento es un WebM válido y suman la duración grabada", () => {
+  const total = tabCalls.reduce((a, g) => a + g.duration, 0);
+  assert.ok(tabCalls.every((g) => g.seg === tabCalls.at(-1).seg || g.duration > 5), JSON.stringify(tabCalls.map((g) => g.duration)));
+  assert.ok(total >= RECORD_SECONDS - 6, `total=${total}s`);
+  assert.ok(groqA.every((g) => g.bytes < 25 * 1024 * 1024));
+});
 
 function meanVolume(file, f) {
   const r = require("node:child_process").spawnSync(
@@ -317,10 +329,24 @@ function meanVolume(file, f) {
   const m = /mean_volume:\s*(-?[\d.]+|-inf) dB/.exec(r.stderr);
   return m ? (m[1] === "-inf" ? -120 : Number(m[1])) : -120;
 }
-const mic1500 = meanVolume(dg.file, 1500);
-const ctl1 = meanVolume(dg.file, 4000);
-log(`navegador A (micrófono simulado): 1500Hz=${mic1500}dB (micrófono) 4000Hz=${ctl1}dB (control)`);
-check("tu micrófono se mezcla en la grabación", () => assert.ok(mic1500 > ctl1 + 15, `${mic1500} vs ${ctl1}`));
+const mic1500 = meanVolume(micCalls[0].file, 1500);
+const micCtl = meanVolume(micCalls[0].file, 4000);
+log(`navegador A: pista mic 1500Hz=${mic1500}dB (control ${micCtl}dB)`);
+check("tu micrófono se graba en su propia pista", () => assert.ok(mic1500 > micCtl + 15, `${mic1500} vs ${micCtl}`));
+// Nota: con --use-fake-device-for-media-stream Chrome alimenta también la captura de la pestaña con
+// el archivo del micrófono simulado, así que aquí no se puede medir la separación. Se mide en el
+// navegador B (sin dispositivos simulados): la pista de la pestaña no contiene la frecuencia del micro.
+check("la transcripción distingue «Tú» de «Otros participantes» y alinea los segmentos", () => {
+  const t = row.transcript;
+  assert.ok(t.some((u) => u.label === "Tú" && /Buenos días/.test(u.text)));
+  assert.ok(t.some((u) => u.label === "Otros participantes" && /Gracias, Marta/.test(u.text)));
+  const late = t.find((u) => /plan de pruebas para el viernes/.test(u.text));
+  assert.ok(late && late.start >= 20, `la frase del segundo segmento empieza en ${late && late.start}s`);
+  for (let i = 1; i < t.length; i++) assert.ok(t[i].start >= t[i - 1].start, "orden cronológico");
+});
+check("se descartan las frases que Whisper inventa sobre el silencio", () =>
+  assert.ok(!/Amara/.test(row.transcript_text), row.transcript_text),
+);
 
 const an = captured.anthropic[0];
 check("Claude recibe la transcripción con salida estructurada", () => {
@@ -332,7 +358,8 @@ check("Claude recibe la transcripción con salida estructurada", () => {
   assert.ok(String(an.beta).includes("server-side-fallback-2026-07-01"));
   assert.equal(an.hasSchema, true);
   assert.equal(an.effort, "medium");
-  assert.ok(an.prompt.includes("Hablante 2:"), "la transcripción no está en el prompt");
+  assert.ok(an.prompt.includes("Otros participantes: Gracias, Marta"), "la transcripción no está en el prompt");
+  assert.ok(an.prompt.includes("Tú: Buenos días"));
   assert.ok(an.prompt.includes("Plataforma: Google Meet"));
 });
 check("análisis guardado", () => {
@@ -350,7 +377,8 @@ check("correo enviado con informe y transcripción adjunta", () => {
   assert.ok(mail.htmlBytes > 2000);
   assert.equal(mail.attachments.length, 1);
   assert.match(mail.attachments[0].filename, /^transcripcion-\d{4}-\d{2}-\d{2}\.txt$/);
-  assert.match(mail.attachments[0].content, /Hablante 2: Gracias, Marta/);
+  assert.match(mail.attachments[0].content, /Otros participantes: Gracias, Marta/);
+  assert.match(mail.attachments[0].content, /Tú: Buenos días/);
   assert.ok(mail.text.includes(`${APP}/dashboard/meetings/${meetingId}`));
 });
 check("email_id guardado", () => assert.equal(row.email_id, "email_mock_1"));
@@ -369,7 +397,8 @@ const detail = await panel.textContent("body");
 check("la página de la reunión muestra análisis y transcripción", () => {
   assert.ok(detail.includes("Retrasar el lanzamiento al día 14."));
   assert.ok(detail.includes("Preparar el plan de pruebas de pago"));
-  assert.ok(detail.includes("Hablante 2 (Carlos)"));
+  assert.ok(detail.includes("Otros participantes:"));
+  assert.ok(detail.includes("Tú:"));
   assert.ok(detail.includes("Gracias, Marta"));
 });
 const mobile = await pctx.newPage();
@@ -389,7 +418,7 @@ await waitFor(
 const afterResend = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured`)).json();
 check("«Reenviar correo» envía otro correo sin repetir transcripción ni IA", () => {
   assert.equal(afterResend.resend.length, 2);
-  assert.equal(afterResend.deepgram.length, 1);
+  assert.equal(afterResend.groq.length, groqA.length);
   assert.equal(afterResend.anthropic.length, 1);
 });
 
@@ -430,22 +459,29 @@ const row2 = await waitFor(
   { timeout: 60000, label: "reunión abandonada procesada" },
 );
 const cap2 = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured`)).json();
+const groqB = cap2.groq.slice(groqA.length);
 check("al cerrar la pestaña, la reunión se procesa y se envía igualmente", () => {
   assert.equal(row2.status, "done");
   assert.equal(cap2.resend.length, 3);
   assert.deepEqual(cap2.resend[2].to, ["otro@example.com", "copia@example.com"]);
-  assert.equal(cap2.deepgram[1].query.language, "es");
 });
-const tabFile = cap2.deepgram[1].file;
+check("sin micrófono solo se transcribe la pista de los demás, en el idioma elegido", () => {
+  assert.ok(groqB.length >= 1);
+  assert.ok(groqB.every((g) => g.track === "tab"), JSON.stringify(groqB.map((g) => g.name)));
+  assert.ok(groqB.every((g) => g.language === "es"));
+});
+const tabFile = groqB[0].file;
 const tab440 = meanVolume(tabFile, 440);
 const tab880 = meanVolume(tabFile, 880);
 const ctl2 = meanVolume(tabFile, 4000);
-log(`navegador B (sin simulación): 440Hz=${tab440}dB (pestaña) 880Hz=${tab880}dB 4000Hz=${ctl2}dB (control)`);
+const tab1500 = meanVolume(tabFile, 1500);
+log(`navegador B (sin simulación): 440Hz=${tab440}dB (pestaña) 880Hz=${tab880}dB 1500Hz=${tab1500}dB 4000Hz=${ctl2}dB (control)`);
+check("la pista de los demás solo contiene el audio de la pestaña", () => assert.ok(tab440 > tab1500 + 20, `440=${tab440} 1500=${tab1500}`));
 check("el audio de la pestaña (los demás participantes) se graba fielmente a 440 Hz", () => {
   assert.ok(tab440 > ctl2 + 15, `${tab440} vs control ${ctl2}`);
   assert.ok(tab440 > tab880 + 10, `440=${tab440} debe dominar sobre 880=${tab880}`);
 });
-check("duración de la grabación abandonada ≈ 20 s", () => assert.ok(cap2.deepgram[1].duration >= 14, `dur=${cap2.deepgram[1].duration}`));
+check("duración de la grabación abandonada ≈ 20 s", () => assert.ok(groqB[0].duration >= 14, `dur=${groqB[0].duration}`));
 
 await ctxB.close();
 await plain.close();

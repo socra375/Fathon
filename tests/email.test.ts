@@ -18,7 +18,7 @@ describe("report email", () => {
       timezone: "America/Mexico_City",
       durationSec: 125,
       analysis,
-      talk: [{ speaker: 0, seconds: 100, pct: 80, turns: 3, words: 50 }],
+      talk: [{ speaker: 0, label: "Tú", seconds: 100, pct: 80, turns: 3, words: 50 }],
       transcriptText: "",
       dashboardUrl: "https://example.com/dashboard/meetings/x",
     });
@@ -33,5 +33,6 @@ describe("report email", () => {
     expect(r.html).toContain("https://example.com/dashboard/meetings/x");
     expect(r.subject.startsWith("Minuta · Plan")).toBe(true);
     expect(r.text).toContain("Ana: Preparar demo (viernes)");
+    expect(r.html).toContain("<strong>Tú</strong>");
   });
 });

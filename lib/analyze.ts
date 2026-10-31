@@ -47,7 +47,12 @@ export const ANALYSIS_JSON_SCHEMA = obj({
   follow_up_email: obj({ subject: str, body: str }),
 });
 
-const SYSTEM_ES = `Eres el analista de reuniones de Minuta. Recibes la transcripción automática de una reunión (con marcas de tiempo y hablantes anónimos "Hablante N", que pueden contener errores de reconocimiento) y produces un informe útil para alguien que necesita actuar después de la reunión.
+const SYSTEM_ES = `Eres el analista de reuniones de Minuta. Recibes la transcripción automática de una reunión (con marcas de tiempo y etiquetas de hablante, que puede contener errores de reconocimiento) y produces un informe útil para la persona que grabó la reunión y necesita actuar después.
+
+Etiquetas de hablante:
+- "Tú" es la persona que grabó la reunión (su micrófono).
+- "Otros participantes" agrupa a todas las demás personas en una sola etiqueta: no las distingue entre sí. Si por el contexto se deduce quién habla (alguien dice su nombre, se presenta o le responden por su nombre), úsalo en el informe.
+- "Participante N" o "Hablante N" son personas distintas detectadas automáticamente.
 
 Reglas:
 - Escribe todo el informe en español, aunque la reunión sea en otro idioma.
@@ -57,7 +62,7 @@ Reglas:
 - "topics": temas en orden cronológico; "start" es la marca de tiempo (mm:ss o h:mm:ss) en que empieza el tema.
 - "decisions": solo acuerdos explícitos. Lista vacía si no los hubo.
 - "action_items": tareas concretas. "owner" es el nombre si se menciona, si no la etiqueta del hablante, o "Sin asignar". "due" es la fecha o plazo mencionado, o "" si no se dijo.
-- "speakers": una entrada por cada hablante de la transcripción. "likely_name" solo si se deduce claramente de la conversación (p. ej. alguien le llama por su nombre); si no, "".
+- "speakers": una entrada por cada etiqueta de hablante de la transcripción, con "label" exactamente igual a la etiqueta. "likely_name" solo si se deduce claramente de la conversación (p. ej. alguien le llama por su nombre); si no, "". Para "Tú" y "Otros participantes" deja "likely_name" vacío, salvo que "Tú" se presente con su nombre.
 - "risks": objeciones, bloqueos, riesgos o desacuerdos detectados.
 - "follow_up_email": correo de seguimiento listo para enviar a los participantes, en tono profesional y cercano, con resumen, acuerdos y próximos pasos.
 - Si la transcripción es muy corta o no tiene contenido útil, dilo en "summary" y deja las listas vacías.`;
@@ -78,7 +83,7 @@ export class AnalysisError extends Error {}
 
 export function buildPrompt(input: AnalyzeInput): string {
   const talk = input.talk
-    .map((t) => `- Hablante ${t.speaker + 1}: ${t.pct}% del tiempo de palabra (${t.turns} intervenciones)`)
+    .map((t) => `- ${t.label}: ${t.pct}% del tiempo de palabra (${t.turns} intervenciones)`)
     .join("\n");
   return [
     "<reunion>",

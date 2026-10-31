@@ -3,8 +3,8 @@ import { env } from "./env";
 import { analyze, emptyAnalysis, type Analysis } from "./analyze";
 import { renderReportEmail, sendEmail } from "./email";
 import { mergeUtterances, PLATFORM_NAMES, talkShares, transcriptToText, type Utterance } from "./format";
-import { getSettings } from "./settings";
-import { transcribe } from "./transcribe";
+import { getSettings, type TranscriptionLanguage as TranscriptionLanguageSetting } from "./settings";
+import { toUtterances, transcribeTrack, TranscriptionError, type Track } from "./transcribe";
 import { errorMessage } from "./http";
 
 export interface MeetingRow {
@@ -22,6 +22,7 @@ export interface MeetingRow {
   chunk_count: number;
   transcript: Utterance[] | null;
   transcript_text: string | null;
+  transcript_parts: Record<string, TranscriptPart>;
   language: string | null;
   timezone: string | null;
   analysis: Analysis | null;
@@ -53,15 +54,77 @@ async function setStage(id: string, stage: string) {
   await q("UPDATE meetings SET stage = $2, updated_at = now() WHERE id = $1", [id, stage]);
 }
 
-export async function loadAudio(id: string): Promise<Buffer> {
-  const rows = await q<{ seq: number; data: Buffer }>(
-    "SELECT seq, data FROM audio_chunks WHERE meeting_id = $1 ORDER BY seq",
+export interface TranscriptPart {
+  utterances: Utterance[];
+  language: string | null;
+  warning?: string;
+}
+
+export interface AudioGroup {
+  track: Track;
+  seg: number;
+  segStartMs: number;
+  chunks: number;
+}
+
+/** Pistas y segmentos recibidos. Cada segmento es un WebM independiente. */
+export async function listAudioGroups(id: string): Promise<AudioGroup[]> {
+  const rows = await q<{ track: Track; seg: number; seg_start_ms: number; chunks: string }>(
+    `SELECT track, seg, min(seg_start_ms) AS seg_start_ms, count(*) AS chunks
+       FROM audio_chunks WHERE meeting_id = $1
+      GROUP BY track, seg ORDER BY seg, track`,
     [id],
   );
-  if (rows.length === 0) throw new Error("No se recibió audio de esta reunión.");
-  if (rows[0].seq !== 0) throw new Error("Falta el primer fragmento de audio; la grabación no se puede reconstruir.");
-  // Los fragmentos de MediaRecorder (WebM/Opus) forman un archivo válido al concatenarlos en orden.
+  return rows.map((r) => ({
+    track: r.track,
+    seg: r.seg,
+    segStartMs: r.seg_start_ms,
+    chunks: Number(r.chunks),
+  }));
+}
+
+/** Une los fragmentos de un segmento: los de MediaRecorder (WebM/Opus) forman un archivo válido en orden. */
+export async function loadSegmentAudio(id: string, track: Track, seg: number): Promise<Buffer> {
+  const rows = await q<{ data: Buffer }>(
+    "SELECT data FROM audio_chunks WHERE meeting_id = $1 AND track = $2 AND seg = $3 ORDER BY seq",
+    [id, track, seg],
+  );
   return Buffer.concat(rows.map((r) => r.data));
+}
+
+/**
+ * Transcribe cada pista/segmento que falte y guarda el progreso tras cada uno, de modo que
+ * si se alcanza el límite gratuito del proveedor, «Reintentar» continúa donde se quedó.
+ */
+async function transcribeAll(m: MeetingRow, language: TranscriptionLanguageSetting): Promise<Record<string, TranscriptPart>> {
+  const groups = await listAudioGroups(m.id);
+  if (groups.length === 0) throw new Error("No se recibió audio de esta reunión.");
+  const parts: Record<string, TranscriptPart> = { ...(m.transcript_parts ?? {}) };
+  for (const g of groups) {
+    const key = `${g.track}:${g.seg}`;
+    if (parts[key]) continue;
+    const audio = await loadSegmentAudio(m.id, g.track, g.seg);
+    let part: TranscriptPart;
+    try {
+      const r = await transcribeTrack(audio, g.track, language, `${g.track}-${g.seg}.webm`);
+      part = { utterances: toUtterances(g.track, r.segments, g.segStartMs / 1000), language: r.language };
+    } catch (err) {
+      // El límite de uso y la falta de configuración detienen el proceso (se puede reintentar).
+      // Un segmento dañado (p. ej. perdió su primer fragmento) se omite para no perder el resto.
+      const recoverable = err instanceof TranscriptionError && (err.retryAfterSec !== undefined || /^Falta/.test(err.message));
+      if (recoverable) throw err;
+      part = { utterances: [], language: null, warning: errorMessage(err).slice(0, 300) };
+    }
+    parts[key] = part;
+    await q("UPDATE meetings SET transcript_parts = transcript_parts || $2::jsonb, updated_at = now() WHERE id = $1", [
+      m.id,
+      JSON.stringify({ [key]: part }),
+    ]);
+  }
+  if (Object.values(parts).every((p) => p.warning)) {
+    throw new Error(`No se pudo transcribir ningún segmento: ${Object.values(parts)[0]?.warning ?? ""}`);
+  }
+  return parts;
 }
 
 export function dashboardLink(id: string, baseUrl?: string | null): string | null {
@@ -81,20 +144,19 @@ export async function processMeeting(id: string, baseUrl?: string | null): Promi
   let stage = "transcribing";
 
   try {
-    // 1. Transcripción
+    // 1. Transcripción (por pista y segmento, reanudable)
     if (!m.transcript) {
       await setStage(id, stage);
-      const audio = await loadAudio(id);
-      const result = await transcribe(audio, settings.transcriptionLanguage);
-      const utts = mergeUtterances(result.utterances);
+      const parts = await transcribeAll(m, settings.transcriptionLanguage);
+      const utts = mergeUtterances(Object.values(parts).flatMap((p) => p.utterances));
       const text = transcriptToText(utts, settings.reportLanguage);
-      // El cronómetro de la extensión es más fiable que la cabecera del WebM.
-      const duration = m.duration_sec || result.durationSec || 0;
+      const language = Object.values(parts).find((p) => p.language)?.language ?? null;
+      // El cronómetro de la extensión manda; si no llegó, se estima con la última intervención.
+      const duration = m.duration_sec || Math.round(Math.max(0, ...utts.map((u) => u.end)));
       [m] = await q<MeetingRow>(
-        `UPDATE meetings SET transcript = $2, transcript_text = $3, language = $4,
-                duration_sec = $5, updated_at = now()
+        `UPDATE meetings SET transcript = $2, transcript_text = $3, language = $4, duration_sec = $5, updated_at = now()
           WHERE id = $1 RETURNING *`,
-        [id, JSON.stringify(utts), text, result.language, duration],
+        [id, JSON.stringify(utts), text, language, duration],
       );
     }
 

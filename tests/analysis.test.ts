@@ -32,11 +32,11 @@ describe("analysis schema", () => {
       title: "Demo",
       startedAt: new Date("2026-10-31T10:00:00Z"),
       durationSec: 90,
-      talk: [{ speaker: 0, seconds: 90, pct: 100, turns: 1, words: 1 }],
+      talk: [{ speaker: 0, label: "Tú", seconds: 90, pct: 100, turns: 1, words: 1 }],
       reportLanguage: "es",
     });
     expect(p).toContain("<transcripcion>\n[00:01] Hablante 1: Hola\n</transcripcion>");
-    expect(p).toContain("Hablante 1: 100%");
+    expect(p).toContain("- Tú: 100%");
     expect(p).toContain("Duración: 01:30");
   });
 });

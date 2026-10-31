@@ -1,6 +1,6 @@
 import { env } from "./env";
 import type { Analysis } from "./analyze";
-import { clock, escapeHtml as e, formatDate, PLATFORM_NAMES, speakerLabel, type TalkShare } from "./format";
+import { clock, escapeHtml as e, formatDate, PLATFORM_NAMES, type TalkShare } from "./format";
 
 export interface ReportEmailInput {
   meetingId: string;
@@ -84,7 +84,7 @@ export function renderReportEmail(input: ReportEmailInput): { subject: string; h
   const talk = input.talk.length
     ? input.talk
         .map((t) => {
-          const label = speakerLabel(t.speaker);
+          const label = t.label;
           const info = names.get(label.toLowerCase());
           const name = info?.likely_name ? `${label} (${info.likely_name})` : label;
           return `<div style="margin:0 0 10px;font:14px/1.4 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:${C.ink}">

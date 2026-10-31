@@ -3,7 +3,7 @@ import { notFound, redirect } from "next/navigation";
 import { AppHeader, STAGE_LABELS, StatusBadge } from "@/components/AppHeader";
 import { isDashboardAuthed } from "@/lib/auth";
 import { q } from "@/lib/db";
-import { clock, formatDate, PLATFORM_NAMES, speakerLabel, talkShares } from "@/lib/format";
+import { clock, formatDate, labelOf, PLATFORM_NAMES, talkShares } from "@/lib/format";
 import { isUuid } from "@/lib/http";
 import type { MeetingRow } from "@/lib/pipeline";
 
@@ -45,8 +45,7 @@ export default async function MeetingPage({
   const utts = m.transcript ?? [];
   const talk = talkShares(utts);
   const names = new Map((a?.speakers ?? []).map((s) => [s.label.toLowerCase(), s]));
-  const nameOf = (speaker: number) => {
-    const label = speakerLabel(speaker);
+  const nameOf = (label: string) => {
     const n = names.get(label.toLowerCase())?.likely_name;
     return n ? `${label} (${n})` : label;
   };
@@ -185,11 +184,11 @@ export default async function MeetingPage({
                 <h2>Participación</h2>
                 {talk.length === 0 && <p className="sub">—</p>}
                 {talk.map((t) => {
-                  const info = names.get(speakerLabel(t.speaker).toLowerCase());
+                  const info = names.get(t.label.toLowerCase());
                   return (
                     <div key={t.speaker} style={{ fontSize: 14, marginBottom: 10 }}>
                       <div>
-                        <strong className={`s${t.speaker % 6}`}>{nameOf(t.speaker)}</strong>{" "}
+                        <strong className={`s${t.speaker % 6}`}>{nameOf(t.label)}</strong>{" "}
                         <span className="sub" style={{ display: "inline" }}>
                           · {t.pct}% · {clock(t.seconds)}
                         </span>
@@ -228,7 +227,7 @@ export default async function MeetingPage({
                 <div className="utt" key={i}>
                   <span className="t">{clock(u.start)}</span>
                   <p>
-                    <span className={`s s${u.speaker % 6}`}>{nameOf(u.speaker)}:</span>
+                    <span className={`s s${u.speaker % 6}`}>{nameOf(labelOf(u))}:</span>
                     {u.text}
                   </p>
                 </div>

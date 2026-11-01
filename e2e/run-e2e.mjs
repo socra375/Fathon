@@ -274,6 +274,15 @@ await sleep(2500);
 const lobbyHasButton = await lobby.locator("#minuta-root").count();
 check("sin botón en meet.google.com/landing", () => assert.equal(lobbyHasButton, 0));
 await lobby.close();
+// Meet usa varias formas de dirección; /meet/<código> es la que llevaba tu reunión real.
+for (const urlPath of ["/meet/kqn-nwvj-jdp", "/_meet/abc-defg-hij", "/lookup/abcd1234"]) {
+  const alt = await ctx.newPage();
+  await alt.goto(`https://meet.google.com${urlPath}`);
+  await sleep(2500);
+  const altCount = await alt.locator("#minuta-root").count();
+  check(`aparece el botón en meet.google.com${urlPath}`, () => assert.equal(altCount, 1));
+  await alt.close();
+}
 
 const meet = await ctx.newPage();
 meet.on("console", (m) => process.env.E2E_VERBOSE && console.log("[page]", m.text()));

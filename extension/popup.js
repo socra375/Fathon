@@ -37,6 +37,18 @@ async function refresh() {
   }
 }
 
+async function showDiag() {
+  const { minutaDiag } = await chrome.storage.local.get("minutaDiag");
+  if (!minutaDiag) return;
+  const age = Math.round((Date.now() - minutaDiag.at) / 1000);
+  const lines = [
+    `Pestaña de reunión: ${minutaDiag.platform} · ${minutaDiag.path}`,
+    `Botón en la página: ${minutaDiag.mounted ? "sí" : "no"} (comprobaciones: ${minutaDiag.checks}, hace ${age} s)`,
+    minutaDiag.error ? `Error: ${minutaDiag.error}` : "Sin errores.",
+  ];
+  $("diag").textContent = lines.join("\n");
+}
+
 async function init() {
   const s = await chrome.storage.local.get(["includeMic", "serverUrl", "apiKey"]);
   $("includeMic").checked = s.includeMic !== false;
@@ -50,6 +62,8 @@ async function init() {
     refresh();
   });
   refresh();
+  showDiag();
+  setInterval(showDiag, 2000);
 }
 
 init();

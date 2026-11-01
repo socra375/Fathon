@@ -429,15 +429,43 @@
   }
 
   // Mostrar u ocultar según la página (Meet y Zoom son aplicaciones de una sola página).
-  function sync() {
-    const shouldShow = isMeetingPage() || rec.state !== "idle";
-    if (shouldShow && !host.isConnected) {
-      document.documentElement.appendChild(host);
-      render();
-    } else if (!shouldShow && host.isConnected) {
-      host.remove();
-    }
+  // Diagnóstico visible desde el icono de Minuta: qué ve la extensión en esta pestaña.
+  const diag = { loaded: true, platform: PLATFORM, path: location.pathname, checks: 0, mounted: false, error: "", at: 0 };
+  function saveDiag() {
+    diag.at = Date.now();
+    try {
+      chrome.storage.local.set({ minutaDiag: { ...diag } });
+    } catch {}
   }
+  window.addEventListener("error", (e) => {
+    diag.error = String(e.message || e.error || "error").slice(0, 300);
+    saveDiag();
+  });
+
+  function mount() {
+    const parent = document.documentElement || document.body;
+    if (!parent) throw new Error("La página todavía no tiene documentElement");
+    parent.appendChild(host);
+    render();
+  }
+
+  function sync() {
+    diag.checks += 1;
+    diag.path = location.pathname;
+    try {
+      const shouldShow = isMeetingPage() || rec.state !== "idle";
+      if (shouldShow && !host.isConnected) mount();
+      else if (!shouldShow && host.isConnected) host.remove();
+      diag.mounted = host.isConnected;
+      if (shouldShow && !host.isConnected) diag.error = "No se pudo colocar el botón en la página";
+    } catch (err) {
+      diag.error = String((err && err.message) || err).slice(0, 300);
+      diag.mounted = false;
+      console.error("[Minuta]", err);
+    }
+    if (diag.checks <= 3 || diag.checks % 10 === 0 || diag.error) saveDiag();
+  }
+  saveDiag();
   sync();
   setInterval(sync, 1500);
 })();

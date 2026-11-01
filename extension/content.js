@@ -25,7 +25,8 @@
 
   function isMeetingPage() {
     const p = location.pathname;
-    if (PLATFORM === "meet") return /^\/[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}(\/|$)/i.test(p);
+    // Meet usa varias formas: /abc-defg-hij, /meet/abc-defg-hij, /_meet/abc-defg-hij y /lookup/<id>.
+    if (PLATFORM === "meet") return /(^|\/)[a-z]{3,4}-[a-z]{4}-[a-z]{3,4}(\/|$)/i.test(p) || /^\/lookup\/[^/]+/i.test(p);
     if (PLATFORM === "zoom") return /\/wc\//.test(p);
     if (PLATFORM === "teams") return true;
     return false;

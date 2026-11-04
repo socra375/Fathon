@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS meetings (
   analysis        jsonb,              -- salida estructurada de la IA
   analysis_parts  jsonb NOT NULL DEFAULT '[]'::jsonb, -- análisis parciales por tramo (modelo gratuito)
   continuations   integer NOT NULL DEFAULT 0,          -- veces que el proceso continuó en otra invocación
+  resume_at       timestamptz,        -- el proceso espera a esta hora (un proveedor de IA está en pausa)
+  email_failed    text,               -- destinatarios a los que no se pudo enviar, con el motivo
   email_to        text,
   email_id        text,
   emailed_at      timestamptz,
@@ -37,6 +39,8 @@ ALTER TABLE meetings ADD COLUMN IF NOT EXISTS timezone text;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS transcript_parts jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS analysis_parts jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE meetings ADD COLUMN IF NOT EXISTS continuations integer NOT NULL DEFAULT 0;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS resume_at timestamptz;
+ALTER TABLE meetings ADD COLUMN IF NOT EXISTS email_failed text;
 
 -- Audio en trozos de ~15 s tal como los sube la extensión. Se borran al terminar.
 -- track: 'tab' (audio de la pestaña = los demás), 'mic' (tu micrófono) o 'mix' (versión antigua, mezclado).
@@ -69,4 +73,12 @@ END $$;
 CREATE TABLE IF NOT EXISTS settings (
   key    text PRIMARY KEY,
   value  text NOT NULL
+);
+
+-- Proveedores de IA/correo en pausa (límite alcanzado). La clave lleva el paso: 'analysis:gemini', 'stt:groq'…
+CREATE TABLE IF NOT EXISTS provider_state (
+  provider      text PRIMARY KEY,
+  blocked_until timestamptz NOT NULL,
+  reason        text NOT NULL DEFAULT '',
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );

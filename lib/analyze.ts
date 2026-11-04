@@ -1,7 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
-import { env } from "./env";
 import { clock, type TalkShare } from "./format";
+import { extractJson } from "./json";
 import type { ReportLanguage } from "./settings";
 
 /** Estructura del análisis que devuelve la IA (validada con zod después de la llamada). */
@@ -106,7 +105,7 @@ export function meetingHeader(input: AnalyzeInput): string {
 export function parseAnalysis(text: string): Analysis {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = JSON.parse(extractJson(text));
   } catch {
     throw new AnalysisError("La IA devolvió un JSON no válido.");
   }
@@ -127,42 +126,6 @@ export function buildPrompt(input: AnalyzeInput): string {
     "",
     "Genera el informe de la reunión siguiendo el esquema.",
   ].join("\n");
-}
-
-/** Análisis con Claude (de pago): una sola llamada con toda la transcripción. */
-export async function analyzeWithClaude(input: AnalyzeInput): Promise<Analysis> {
-  const apiKey = env.anthropicKey();
-  if (!apiKey) throw new AnalysisError("Falta ANTHROPIC_API_KEY");
-  const client = new Anthropic({ apiKey, timeout: 280_000, maxRetries: 2 });
-
-  // Streaming: la transcripción puede ser larga. `fallbacks: "default"` reintenta en el
-  // servidor con otro modelo si el principal rechaza la petición por política.
-  const stream = client.beta.messages.stream({
-    model: env.anthropicModel(),
-    max_tokens: 32_000,
-    betas: ["server-side-fallback-2026-07-01"],
-    fallbacks: "default",
-    thinking: { type: "adaptive" },
-    output_config: {
-      effort: "medium",
-      format: { type: "json_schema", schema: ANALYSIS_JSON_SCHEMA },
-    },
-    system: systemPrompt(input.reportLanguage),
-    messages: [{ role: "user", content: buildPrompt(input) }],
-  });
-  const message = await stream.finalMessage();
-
-  if (message.stop_reason === "refusal") {
-    throw new AnalysisError("La IA rechazó analizar esta reunión.");
-  }
-  if (message.stop_reason === "max_tokens") {
-    throw new AnalysisError("El análisis superó el límite de longitud.");
-  }
-  const text = message.content
-    .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
-    .map((b) => b.text)
-    .join("");
-  return parseAnalysis(text);
 }
 
 /** Informe mínimo cuando no se detectó voz (no se gasta una llamada a la IA). */

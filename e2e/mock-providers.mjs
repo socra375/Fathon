@@ -7,8 +7,20 @@ import path from "node:path";
 
 const PORT = Number(process.env.MOCK_PORT || 4010);
 const OUT = process.env.MOCK_OUT || path.resolve("e2e/.tmp");
-const captured = { deepgram: [], groq: [], groqChat: [], anthropic: [], resend: [] };
+import { SMTPServer } from "smtp-server";
+
+const SMTP_PORT = Number(process.env.MOCK_SMTP_PORT || 4025);
+const captured = { deepgram: [], groq: [], groqFail: [], groqChat: [], gemini: [], openrouter: [], anthropic: [], resend: [], resendRefused: [], smtp: [] };
 let groqChat429Sent = false;
+// Interruptores para provocar fallos desde la prueba (POST /__control con JSON).
+const state = {
+  groqChat429RetryAfter: 1, // segundos que pide esperar el primer 429 del chat de Groq
+  whisper429Until: 0, // hasta esa hora (ms) Whisper responde 429; se activa con {whisper429For: segundos}
+  gemini429: false, // Gemini sin cuota diaria
+  openrouter429: false,
+  resendOwn: null, // si se define, Resend solo deja enviar a esa dirección (como sin dominio verificado)
+  deepgram401: false,
+};
 
 function readBody(req) {
   return new Promise((resolve) => {
@@ -64,6 +76,17 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const body = await readBody(req);
 
+  if (req.method === "POST" && url.pathname === "/__control") {
+    const ctl = JSON.parse(body.toString("utf8") || "{}");
+    if ("whisper429For" in ctl) {
+      state.whisper429Until = ctl.whisper429For > 0 ? Date.now() + ctl.whisper429For * 1000 : 0;
+      delete ctl.whisper429For;
+    }
+    Object.assign(state, ctl);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(state));
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/__captured") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(captured));
@@ -71,6 +94,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---------------- Deepgram
+  if (req.method === "POST" && url.pathname === "/deepgram/v1/listen" && state.deepgram401) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ err_code: "INVALID_AUTH", err_msg: "Invalid credentials." }));
+    return;
+  }
   if (req.method === "POST" && url.pathname === "/deepgram/v1/listen") {
     const file = path.join(OUT, `received-audio-${captured.deepgram.length}.webm`);
     writeFileSync(file, body);
@@ -112,6 +140,13 @@ const server = http.createServer(async (req, res) => {
     }).formData();
     const file = form.get("file");
     const name = file && typeof file === "object" ? file.name : "";
+    const whisperLeft = Math.ceil((state.whisper429Until - Date.now()) / 1000);
+    if (whisperLeft > 0) {
+      captured.groqFail.push({ name, status: 429 });
+      res.writeHead(429, { "Content-Type": "application/json", "retry-after": String(whisperLeft) });
+      res.end(JSON.stringify({ error: { message: "Rate limit reached for model whisper-large-v3-turbo: audio seconds per hour (ASPH)" } }));
+      return;
+    }
     const bytes = file && typeof file === "object" ? Buffer.from(await file.arrayBuffer()) : Buffer.alloc(0);
     const out = path.join(OUT, `groq-${captured.groq.length}-${name}`);
     writeFileSync(out, bytes);
@@ -165,7 +200,7 @@ const server = http.createServer(async (req, res) => {
     if (!groqChat429Sent) {
       groqChat429Sent = true;
       captured.groqChat.push({ kind, status: 429 });
-      res.writeHead(429, { "Content-Type": "application/json", "retry-after": "1", "x-ratelimit-reset-tokens": "1s" });
+      res.writeHead(429, { "Content-Type": "application/json", "retry-after": String(state.groqChat429RetryAfter), "x-ratelimit-reset-tokens": `${state.groqChat429RetryAfter}s` });
       res.end(JSON.stringify({ error: { message: "Rate limit reached for tokens per minute" } }));
       return;
     }
@@ -192,6 +227,40 @@ const server = http.createServer(async (req, res) => {
       "x-ratelimit-reset-tokens": "1s",
     });
     res.end(JSON.stringify({ id: "chatcmpl-mock", choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(out) }, finish_reason: "stop" }] }));
+    return;
+  }
+
+  // ---------------- Gemini y OpenRouter (API compatible con OpenAI)
+  const llmMatch = /^\/(gemini\/v1beta\/openai|openrouter)\/chat\/completions$/.exec(url.pathname);
+  if (req.method === "POST" && llmMatch) {
+    const which = llmMatch[1].startsWith("gemini") ? "gemini" : "openrouter";
+    const j = JSON.parse(body.toString("utf8"));
+    const user = String(j.messages?.find((m) => m.role === "user")?.content ?? "");
+    const blocked = which === "gemini" ? state.gemini429 : state.openrouter429;
+    captured[which].push({
+      status: blocked ? 429 : 200,
+      auth: req.headers.authorization,
+      model: j.model,
+      responseFormat: j.response_format?.type,
+      referer: req.headers["http-referer"],
+      title: req.headers["x-title"],
+      user: user.slice(0, 3000),
+    });
+    if (blocked) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          which === "gemini"
+            ? { error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "You exceeded your current quota (requests per day). Please retry in 31200s." } }
+            : { error: { code: 429, message: "Rate limit exceeded: free-models-per-day" } },
+        ),
+      );
+      return;
+    }
+    const analysis = fullAnalysis(user);
+    analysis.title = which === "gemini" ? "Análisis hecho por Gemini" : "Análisis hecho por OpenRouter";
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ id: "chatcmpl-mock", choices: [{ index: 0, message: { role: "assistant", content: JSON.stringify(analysis) }, finish_reason: "stop" }] }));
     return;
   }
 
@@ -238,6 +307,18 @@ const server = http.createServer(async (req, res) => {
   // ---------------- Resend
   if (req.method === "POST" && url.pathname === "/resend/emails") {
     const j = JSON.parse(body.toString("utf8"));
+    if (state.resendOwn && j.to[0].toLowerCase() !== state.resendOwn) {
+      captured.resendRefused.push({ to: j.to });
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          message: `You can only send testing emails to your own email address (${state.resendOwn}). To send emails to other recipients, please verify a domain at resend.com/domains, and change the \`from\` address to an email using this domain.`,
+          name: "validation_error",
+          statusCode: 403,
+        }),
+      );
+      return;
+    }
     const id = `email_mock_${captured.resend.length + 1}`;
     writeFileSync(path.join(OUT, `email-${captured.resend.length}.html`), j.html || "");
     captured.resend.push({
@@ -261,4 +342,30 @@ const server = http.createServer(async (req, res) => {
   res.end(JSON.stringify({ error: "not found", path: url.pathname }));
 });
 
-server.listen(PORT, "127.0.0.1", () => console.log(`mock providers on :${PORT}`));
+// Servidor SMTP real (sin cifrado) que guarda lo que recibe, para probar el envío por Gmail/SMTP.
+const smtp = new SMTPServer({
+  authOptional: true,
+  disabledCommands: ["STARTTLS"],
+  allowInsecureAuth: true,
+  onAuth(auth, _session, cb) {
+    cb(null, { user: auth.username });
+  },
+  onData(stream, session, cb) {
+    const chunks = [];
+    stream.on("data", (c) => chunks.push(c));
+    stream.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8");
+      captured.smtp.push({
+        user: session.user,
+        from: session.envelope.mailFrom.address,
+        to: session.envelope.rcptTo.map((r) => r.address),
+        subject: /^Subject: (.*)$/m.exec(raw)?.[1] ?? "",
+        hasAttachment: /filename="?transcripcion-\d{4}-\d{2}-\d{2}\.txt/.test(raw),
+        bytes: raw.length,
+      });
+      cb();
+    });
+  },
+});
+smtp.listen(SMTP_PORT, "127.0.0.1");
+server.listen(PORT, "127.0.0.1", () => console.log(`mock providers on :${PORT} (smtp :${SMTP_PORT})`));

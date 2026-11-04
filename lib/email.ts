@@ -1,4 +1,3 @@
-import { env } from "./env";
 import type { Analysis } from "./analyze";
 import { clock, escapeHtml as e, formatDate, PLATFORM_NAMES, type TalkShare } from "./format";
 
@@ -150,40 +149,4 @@ export function renderReportEmail(input: ReportEmailInput): { subject: string; h
     .join("\n");
 
   return { subject, html, text };
-}
-
-export class EmailError extends Error {}
-
-export async function sendEmail(opts: {
-  to: string[];
-  subject: string;
-  html: string;
-  text: string;
-  attachments?: { filename: string; content: string }[];
-}): Promise<string> {
-  const key = env.resendKey();
-  if (!key) throw new EmailError("Falta RESEND_API_KEY");
-  const res = await fetch(`${env.resendUrl()}/emails`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      from: env.emailFrom(),
-      to: opts.to,
-      subject: opts.subject,
-      html: opts.html,
-      text: opts.text,
-      attachments: opts.attachments?.map((a) => ({
-        filename: a.filename,
-        content: Buffer.from(a.content, "utf8").toString("base64"),
-      })),
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const body = await res.text();
-  if (!res.ok) throw new EmailError(`Resend respondió ${res.status}: ${body.slice(0, 400)}`);
-  try {
-    return (JSON.parse(body) as { id?: string }).id ?? "";
-  } catch {
-    return "";
-  }
 }

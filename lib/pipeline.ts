@@ -1,12 +1,14 @@
 import { q } from "./db";
 import { env } from "./env";
-import { analyzeWithClaude, emptyAnalysis, type Analysis, type AnalyzeInput } from "./analyze";
-import { analyzeWithGroq } from "./analyze-groq";
-import { Budget, ContinueLater } from "./budget";
-import { renderReportEmail, sendEmail } from "./email";
+import { emptyAnalysis, type Analysis, type AnalyzeInput } from "./analyze";
+import { analyzeRotating } from "./analyze-rotating";
+import { Budget, ContinueLater, RetryLater } from "./budget";
+import { renderReportEmail } from "./email";
+import { deliverReport, describeFailures, parseRecipients } from "./mailer";
+import { AllProvidersFailed } from "./rotator";
 import { mergeUtterances, PLATFORM_NAMES, talkShares, transcriptToText, type Utterance } from "./format";
 import { getSettings, type TranscriptionLanguage as TranscriptionLanguageSetting } from "./settings";
-import { toUtterances, transcribeTrack, TranscriptionError, type Track } from "./transcribe";
+import { toUtterances, transcribeTrack, type Track } from "./transcribe";
 import { errorMessage } from "./http";
 
 export interface MeetingRow {
@@ -30,6 +32,8 @@ export interface MeetingRow {
   analysis: Analysis | null;
   analysis_parts: (Analysis | null)[];
   continuations: number;
+  resume_at: Date | null;
+  email_failed: string | null;
   email_to: string | null;
   email_id: string | null;
   emailed_at: Date | null;
@@ -118,22 +122,14 @@ async function transcribeAll(
     const audio = await loadSegmentAudio(m.id, g.track, g.seg);
     let part: TranscriptPart;
     try {
-      let r;
-      try {
-        r = await transcribeTrack(audio, g.track, language, `${g.track}-${g.seg}.webm`);
-      } catch (err) {
-        // Límite por minuto del plan gratuito: si la espera es corta, se espera y se reintenta una vez.
-        if (!(err instanceof TranscriptionError) || err.retryAfterSec === undefined || err.retryAfterSec > 90) throw err;
-        await budget.wait(err.retryAfterSec * 1000 + 500);
-        r = await transcribeTrack(audio, g.track, language, `${g.track}-${g.seg}.webm`);
-      }
+      const r = await transcribeTrack(audio, g.track, language, `${g.track}-${g.seg}.webm`, { budget });
       part = { utterances: toUtterances(g.track, r.segments, g.segStartMs / 1000), language: r.language };
     } catch (err) {
+      // Esperar (RetryLater) o continuar en otra invocación detiene el proceso sin perder lo ya hecho.
       if (err instanceof ContinueLater) throw err;
-      // El límite de uso y la falta de configuración detienen el proceso (se puede reintentar).
+      // Sin ningún proveedor configurado es un error de ajustes: no se salta el segmento.
+      if (err instanceof AllProvidersFailed && err.details.length === 0) throw err;
       // Un segmento dañado (p. ej. perdió su primer fragmento) se omite para no perder el resto.
-      const recoverable = err instanceof TranscriptionError && (err.retryAfterSec !== undefined || /^Falta/.test(err.message));
-      if (recoverable) throw err;
       part = { utterances: [], language: null, warning: errorMessage(err).slice(0, 300) };
     }
     parts[key] = part;
@@ -154,22 +150,26 @@ export function dashboardLink(id: string, baseUrl?: string | null): string | nul
   return base ? `${base.replace(/\/$/, "")}/dashboard/meetings/${id}` : null;
 }
 
-/** Análisis con Claude (si hay clave) o gratis con Groq. */
+/** Análisis con el primer proveedor de IA disponible (Claude, Gemini, OpenRouter, Groq…). */
 export async function runAnalysis(m: MeetingRow, input: AnalyzeInput, budget: Budget): Promise<Analysis> {
-  const provider = env.analysisProvider();
-  if (provider === "claude") return analyzeWithClaude(input);
-  if (provider === "groq") {
-    return analyzeWithGroq(input, budget, {
+  return analyzeRotating(input, {
+    budget,
+    progress: {
       parts: m.analysis_parts ?? [],
       save: async (parts) => {
         await q("UPDATE meetings SET analysis_parts = $2::jsonb, updated_at = now() WHERE id = $1", [m.id, JSON.stringify(parts)]);
       },
-    });
-  }
-  throw new Error("Falta configurar el análisis: añade ANTHROPIC_API_KEY (Claude) o GROQ_API_KEY (gratis).");
+    },
+  });
 }
 
 const MAX_CONTINUATIONS = 40;
+/** Cada continuación espera hasta ~4 min: 40 seguidas son unas 2,5 h. Más allá no tiene sentido seguir esperando. */
+const MAX_AUTO_WAIT_MS = 2.5 * 3_600_000;
+
+function hhmmUtc(d: Date): string {
+  return d.toISOString().slice(11, 16) + " UTC";
+}
 
 /**
  * Pide al propio servidor que siga procesando la reunión en una invocación nueva
@@ -211,6 +211,16 @@ export async function processMeeting(
   let stage = "transcribing";
 
   try {
+    // 0. Si un proveedor de IA estaba en pausa, esta ejecución espera a que termine la pausa.
+    if (claimed.resume_at) {
+      const wait = new Date(claimed.resume_at).getTime() - Date.now();
+      if (wait > 0) {
+        const left = await budget.sleepUpTo(wait);
+        if (left > 0) throw new RetryLater(new Date(Date.now() + left), "Esperando a que termine la pausa del proveedor de IA");
+      }
+      await q("UPDATE meetings SET resume_at = NULL WHERE id = $1", [id]);
+    }
+
     // 1. Transcripción (por pista y segmento, reanudable)
     if (!m.transcript) {
       await setStage(id, stage);
@@ -255,12 +265,14 @@ export async function processMeeting(
       );
     }
 
-    // 3. Correo
+    // 3. Correo: a cada destinatario por separado; un fallo no impide que lleguen los demás.
     stage = "emailing";
     if (!m.emailed_at) {
       await setStage(id, stage);
-      const to = (m.email_to || settings.emailTo).split(",").map((s) => s.trim()).filter(Boolean);
-      if (to.length === 0) throw new Error("No hay destinatario de correo configurado (Ajustes → Correo).");
+      const wanted = parseRecipients(settings.emailTo);
+      if (wanted.length === 0) throw new Error("No hay destinatario de correo configurado (Ajustes → Enviar informes a).");
+      const already = parseRecipients(m.email_to);
+      const pending = wanted.filter((w) => !already.some((a) => a.toLowerCase() === w.toLowerCase()));
       const talk = talkShares(m.transcript ?? []);
       const mail = renderReportEmail({
         meetingId: id,
@@ -274,18 +286,25 @@ export async function processMeeting(
         dashboardUrl: dashboardLink(id, baseUrl),
       });
       const date = new Date(m.started_at).toISOString().slice(0, 10);
-      const emailId = await sendEmail({
-        to,
-        subject: mail.subject,
-        html: mail.html,
-        text: mail.text,
-        attachments: m.transcript_text
-          ? [{ filename: `transcripcion-${date}.txt`, content: m.transcript_text }]
-          : undefined,
-      });
+      const result =
+        pending.length === 0
+          ? { delivered: [], failed: [] }
+          : await deliverReport(pending, {
+              subject: mail.subject,
+              html: mail.html,
+              text: mail.text,
+              attachments: m.transcript_text ? [{ filename: `transcripcion-${date}.txt`, content: m.transcript_text }] : undefined,
+            });
+      const delivered = [...already, ...result.delivered.map((d) => d.to)];
+      if (delivered.length === 0) {
+        throw new Error(
+          `No se pudo enviar el informe a nadie. ${describeFailures(result.failed)}. Añade un servicio de correo (SMTP de Gmail) o cambia los destinatarios en Ajustes.`,
+        );
+      }
       await q(
-        "UPDATE meetings SET emailed_at = now(), email_id = $2, email_to = $3, updated_at = now() WHERE id = $1",
-        [id, emailId, to.join(", ")],
+        `UPDATE meetings SET emailed_at = now(), email_id = COALESCE($2, email_id), email_to = $3, email_failed = $4, updated_at = now()
+          WHERE id = $1`,
+        [id, result.delivered[0]?.id || null, delivered.join(", "), result.failed.length ? describeFailures(result.failed) : null],
       );
     }
 
@@ -293,15 +312,19 @@ export async function processMeeting(
     if (!settings.keepAudio) await q("DELETE FROM audio_chunks WHERE meeting_id = $1", [id]);
   } catch (err) {
     if (err instanceof ContinueLater) {
+      const at = err instanceof RetryLater ? err.at : null;
+      const tooLong = at !== null && at.getTime() - Date.now() > MAX_AUTO_WAIT_MS;
       const n = (m.continuations ?? 0) + 1;
-      if (n <= MAX_CONTINUATIONS) {
-        await q("UPDATE meetings SET continuations = $2, updated_at = now() WHERE id = $1", [id, n]);
+      if (!tooLong && n <= MAX_CONTINUATIONS) {
+        await q("UPDATE meetings SET continuations = $2, resume_at = $3, updated_at = now() WHERE id = $1", [id, n, at]);
         if (await scheduleContinuation(id, baseUrl)) return;
       }
       err = new Error(
-        n > MAX_CONTINUATIONS
-          ? "El procesamiento tardó demasiado (límites del plan gratuito). Pulsa «Reintentar» más tarde."
-          : `${err.message}. No se pudo continuar automáticamente: pulsa «Reintentar».`,
+        tooLong
+          ? `Todas las IA disponibles están en pausa hasta las ${hhmmUtc(at!)}. Pulsa «Reintentar» a partir de esa hora, o añade otra clave de IA (GEMINI_API_KEY u OPENROUTER_API_KEY, gratis). ${err.message.slice(0, 500)}`
+          : n > MAX_CONTINUATIONS
+            ? "El procesamiento tardó demasiado (límites de los planes gratuitos). Pulsa «Reintentar» más tarde."
+            : `${err.message}. No se pudo continuar automáticamente: pulsa «Reintentar».`,
       );
     }
     console.error(`[minuta] meeting ${id} failed at ${stage}:`, err);

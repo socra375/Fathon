@@ -1,4 +1,7 @@
-import { env } from "./env";
+import { Budget } from "./budget";
+import { dbCooldowns } from "./cooldowns";
+import { env, type SttId } from "./env";
+import { AllProvidersFailed, classifyHttpError, ProviderLimit, rotate, type Candidate, type CooldownStore } from "./rotator";
 import type { Utterance } from "./format";
 import type { TranscriptionLanguage } from "./settings";
 
@@ -27,16 +30,6 @@ export interface TrackResult {
   segments: RawSegment[];
   durationSec: number;
   language: string | null;
-}
-
-export class TranscriptionError extends Error {
-  constructor(
-    message: string,
-    /** Segundos tras los que conviene reintentar (límite de uso del plan gratuito). */
-    readonly retryAfterSec?: number,
-  ) {
-    super(message);
-  }
 }
 
 // ---------------------------------------------------------------- etiquetas de hablante
@@ -114,7 +107,7 @@ export function filterWhisperSegments(segs: WhisperSegment[]): RawSegment[] {
 
 async function transcribeGroq(audio: Buffer, language: TranscriptionLanguage, filename: string): Promise<TrackResult> {
   const key = env.groqKey();
-  if (!key) throw new TranscriptionError("Falta GROQ_API_KEY");
+  if (!key) throw new Error("Falta GROQ_API_KEY");
   const form = new FormData();
   form.append("file", new Blob([new Uint8Array(audio)], { type: "audio/webm" }), filename);
   form.append("model", env.groqModel());
@@ -123,23 +116,18 @@ async function transcribeGroq(audio: Buffer, language: TranscriptionLanguage, fi
   form.append("temperature", "0");
   if (language !== "multi") form.append("language", language);
 
-  const res = await fetch(`${env.groqUrl()}/openai/v1/audio/transcriptions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}` },
-    body: form,
-    signal: AbortSignal.timeout(120_000),
-  });
-  if (res.status === 429) {
-    const retry = Number(res.headers.get("retry-after")) || 60;
-    throw new TranscriptionError(
-      `Se alcanzó el límite gratuito de Groq. Pulsa «Reintentar» dentro de ${Math.ceil(retry / 60)} min (lo ya transcrito se conserva).`,
-      retry,
-    );
+  let res: Response;
+  try {
+    res = await fetch(`${env.groqUrl()}/openai/v1/audio/transcriptions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}` },
+      body: form,
+      signal: AbortSignal.timeout(120_000),
+    });
+  } catch (err) {
+    throw new ProviderLimit(`groq: sin respuesta (${err instanceof Error ? err.message : err})`, "groq", 120_000, "overload");
   }
-  if (!res.ok) {
-    const body = (await res.text()).slice(0, 500);
-    throw new TranscriptionError(`Groq respondió ${res.status}: ${body}`);
-  }
+  if (!res.ok) throw classifyHttpError("groq", res.status, res.headers, await res.text());
   const data = (await res.json()) as WhisperResponse;
   const segments = data.segments
     ? filterWhisperSegments(data.segments)
@@ -198,42 +186,64 @@ export function parseDeepgram(data: DeepgramResponse, fallbackLanguage: string |
 
 async function callDeepgram(audio: Buffer, model: string, language: TranscriptionLanguage, diarize: boolean) {
   const key = env.deepgramKey();
-  if (!key) throw new TranscriptionError("Falta DEEPGRAM_API_KEY");
-  return fetch(`${env.deepgramUrl()}/v1/listen?${deepgramQuery(model, language, diarize)}`, {
-    method: "POST",
-    headers: { Authorization: `Token ${key}`, "Content-Type": "audio/webm" },
-    body: new Uint8Array(audio),
-    signal: AbortSignal.timeout(240_000),
-  });
+  if (!key) throw new Error("Falta DEEPGRAM_API_KEY");
+  try {
+    return await fetch(`${env.deepgramUrl()}/v1/listen?${deepgramQuery(model, language, diarize)}`, {
+      method: "POST",
+      headers: { Authorization: `Token ${key}`, "Content-Type": "audio/webm" },
+      body: new Uint8Array(audio),
+      signal: AbortSignal.timeout(240_000),
+    });
+  } catch (err) {
+    throw new ProviderLimit(`deepgram: sin respuesta (${err instanceof Error ? err.message : err})`, "deepgram", 120_000, "overload");
+  }
 }
 
 async function transcribeDeepgram(audio: Buffer, language: TranscriptionLanguage, diarize: boolean): Promise<TrackResult> {
   const primary = env.deepgramModel();
   let res = await callDeepgram(audio, primary, language, diarize);
   if (res.status === 400 && primary !== "nova-2") res = await callDeepgram(audio, "nova-2", language, diarize);
-  if (!res.ok) {
-    const body = (await res.text()).slice(0, 500);
-    throw new TranscriptionError(`Deepgram respondió ${res.status}: ${body}`);
-  }
+  if (!res.ok) throw classifyHttpError("deepgram", res.status, res.headers, await res.text());
   return parseDeepgram((await res.json()) as DeepgramResponse, language === "multi" ? null : language, diarize);
 }
 
-// ---------------------------------------------------------------- entrada única
+// ---------------------------------------------------------------- rotación
 
-export function currentProvider(): Provider {
-  const p = env.transcriptionProvider();
-  if (!p) throw new TranscriptionError("Falta configurar la transcripción: añade GROQ_API_KEY (gratis) o DEEPGRAM_API_KEY.");
-  return p;
+export interface TranscribeContext {
+  budget?: Budget;
+  store?: CooldownStore;
 }
 
-/** Transcribe el audio de una pista. En la pista del micrófono no se separan hablantes: es solo tu voz. */
+/** Proveedores de voz con clave, en el orden configurado. */
+export function sttProviders(): { id: SttId; label: string }[] {
+  const has: Record<SttId, boolean> = { groq: Boolean(env.groqKey()), deepgram: Boolean(env.deepgramKey()) };
+  const labels: Record<SttId, string> = { groq: "Groq (Whisper)", deepgram: "Deepgram" };
+  const out: { id: SttId; label: string }[] = [];
+  for (const id of env.transcriptionOrder()) if (has[id] && !out.some((o) => o.id === id)) out.push({ id, label: labels[id] });
+  return out;
+}
+
+/**
+ * Transcribe el audio de una pista con el primer proveedor disponible. Si uno alcanza su límite,
+ * pasa al siguiente; si todos están en pausa, espera o lanza `RetryLater`.
+ * En la pista del micrófono no se separan hablantes: es solo tu voz.
+ */
 export async function transcribeTrack(
   audio: Buffer,
   track: Track,
   language: TranscriptionLanguage,
   filename: string,
+  ctx: TranscribeContext = {},
 ): Promise<TrackResult> {
-  const provider = currentProvider();
-  if (provider === "groq") return transcribeGroq(audio, language, filename);
-  return transcribeDeepgram(audio, language, track !== "mic");
+  const providers = sttProviders();
+  if (providers.length === 0) {
+    throw new AllProvidersFailed("Falta configurar la transcripción: añade GROQ_API_KEY (gratis) o DEEPGRAM_API_KEY.", []);
+  }
+  const candidates: Candidate<TrackResult>[] = providers.map((p) => ({
+    id: p.id,
+    label: p.label,
+    run: () => (p.id === "groq" ? transcribeGroq(audio, language, filename) : transcribeDeepgram(audio, language, track !== "mic")),
+  }));
+  const result = await rotate(candidates, { namespace: "stt", store: ctx.store ?? dbCooldowns, budget: ctx.budget });
+  return result.value;
 }

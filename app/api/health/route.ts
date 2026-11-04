@@ -20,6 +20,6 @@ export async function GET() {
       db = false;
     }
   }
-  const ready = db && config.apiKey && config.transcription && config.analysis && config.resend;
+  const ready = db && config.apiKey && config.transcription && config.analysis && config.email;
   return json({ ok: true, ready, db, config, app: "minuta" });
 }

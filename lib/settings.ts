@@ -45,8 +45,3 @@ export async function saveSettings(s: Partial<Settings>): Promise<void> {
     );
   }
 }
-
-export function isValidEmailList(v: string): boolean {
-  const parts = v.split(",").map((p) => p.trim()).filter(Boolean);
-  return parts.length > 0 && parts.length <= 10 && parts.every((p) => /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(p));
-}

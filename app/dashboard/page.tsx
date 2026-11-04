@@ -5,7 +5,9 @@ import { isDashboardAuthed } from "@/lib/auth";
 import { q } from "@/lib/db";
 import { configStatus } from "@/lib/env";
 import { clock, formatDate, PLATFORM_NAMES } from "@/lib/format";
+import { parseRecipients } from "@/lib/mailer";
 import { getSettings } from "@/lib/settings";
+import { humanWait, providerStatus, type ProviderRow } from "@/lib/status";
 
 export const dynamic = "force-dynamic";
 
@@ -22,23 +24,48 @@ interface Row {
 const CHECK_LABELS: Record<string, string> = {
   database: "Base de datos",
   apiKey: "Clave de la extensión",
-  transcription: "Transcripción (Groq gratis o Deepgram)",
-  analysis: "Análisis con IA (Claude o Groq gratis)",
-  resend: "Correo (Resend)",
+  transcription: "Transcripción de voz",
+  analysis: "Análisis con IA",
+  email: "Correo",
 };
+
+function ProviderList({ title, rows }: { title: string; rows: ProviderRow[] }) {
+  const now = Date.now();
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <strong style={{ fontSize: 14 }}>{title}</strong>
+      <ul className="check">
+        {rows.map((r) => {
+          const paused = r.configured && r.blockedUntil && r.blockedUntil.getTime() > now;
+          return (
+            <li key={r.id} title={paused ? r.reason : undefined}>
+              <span className={!r.configured ? "n" : paused ? "p" : "y"}>{!r.configured ? "✗" : paused ? "⏸" : "✓"}</span>
+              <span>
+                {r.label}
+                {!r.configured && <span className="hint"> · falta {r.keyName}</span>}
+                {paused && r.blockedUntil && <span className="hint"> · en pausa, vuelve en {humanWait(r.blockedUntil, now)}</span>}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 export default async function Dashboard({
   searchParams,
 }: {
-  searchParams: Promise<{ settings?: string; deleted?: string }>;
+  searchParams: Promise<{ settings?: string; deleted?: string; why?: string }>;
 }) {
   if (!(await isDashboardAuthed())) redirect("/login");
   const sp = await searchParams;
-  const [meetings, settings] = await Promise.all([
+  const [meetings, settings, providers] = await Promise.all([
     q<Row>(
       "SELECT id, platform, title, status, started_at, duration_sec, timezone FROM meetings ORDER BY started_at DESC LIMIT 100",
     ),
     getSettings(),
+    providerStatus(),
   ]);
   const config = configStatus();
   const missing = Object.entries(config).filter(([, v]) => !v);
@@ -60,7 +87,7 @@ export default async function Dashboard({
         </div>
 
         {sp.settings === "saved" && <div className="banner ok">Ajustes guardados.</div>}
-        {sp.settings === "invalid-email" && <div className="banner err">El correo no es válido.</div>}
+        {sp.settings === "invalid-email" && <div className="banner err">{sp.why ?? "El correo no es válido."}</div>}
         {sp.deleted && <div className="banner ok">Reunión eliminada.</div>}
         {missing.length > 0 && (
           <div className="banner warn">
@@ -121,15 +148,17 @@ export default async function Dashboard({
               <h2 id="h-settings">Ajustes</h2>
               <form method="post" action="/api/settings" className="settings">
                 <label htmlFor="emailTo">Enviar informes a</label>
-                <input
+                <textarea
                   id="emailTo"
                   name="emailTo"
-                  type="text"
-                  inputMode="email"
-                  defaultValue={settings.emailTo}
-                  placeholder="tu@correo.com"
+                  rows={3}
+                  defaultValue={parseRecipients(settings.emailTo).join("\n")}
+                  placeholder={"tu@correo.com\notra@persona.com"}
                 />
-                <p className="hint">Puedes poner varios separados por comas.</p>
+                <p className="hint">
+                  Uno por línea (o separados por comas), hasta 10. Con Resend sin dominio solo llega al correo de tu cuenta;
+                  para el resto configura SMTP (Gmail).
+                </p>
                 <label htmlFor="tl">Idioma de las reuniones</label>
                 <select id="tl" name="transcriptionLanguage" defaultValue={settings.transcriptionLanguage}>
                   <option value="multi">Detectar (español e inglés mezclados)</option>
@@ -149,6 +178,17 @@ export default async function Dashboard({
                   Guardar
                 </button>
               </form>
+            </section>
+
+            <section className="card" aria-labelledby="h-prov">
+              <h2 id="h-prov">IA y correo (rotación automática)</h2>
+              <p className="hint" style={{ marginBottom: 10 }}>
+                Se usa el primero disponible; si uno alcanza su límite, pasa solo al siguiente y vuelve a probarlo cuando
+                termina su pausa.
+              </p>
+              <ProviderList title="Transcripción de voz" rows={providers.stt} />
+              <ProviderList title="Análisis de la reunión" rows={providers.analysis} />
+              <ProviderList title="Envío del correo" rows={providers.email} />
             </section>
 
             <section className="card" aria-labelledby="h-status">

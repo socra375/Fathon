@@ -6,6 +6,7 @@ import { q } from "@/lib/db";
 import { clock, formatDate, labelOf, PLATFORM_NAMES, talkShares } from "@/lib/format";
 import { isUuid } from "@/lib/http";
 import type { MeetingRow } from "@/lib/pipeline";
+import { humanWait } from "@/lib/status";
 
 export const dynamic = "force-dynamic";
 
@@ -74,7 +75,16 @@ export default async function MeetingPage({
 
         {m.status === "processing" && (
           <div className="banner warn" role="status">
-            Procesando{m.stage ? `: ${STAGE_LABELS[m.stage] ?? m.stage}` : ""}… Esta página se actualiza sola.
+            Procesando{m.stage ? `: ${STAGE_LABELS[m.stage] ?? m.stage}` : ""}…
+            {m.resume_at && new Date(m.resume_at).getTime() > Date.now()
+              ? ` Un proveedor de IA alcanzó su límite: la app espera ${humanWait(new Date(m.resume_at))} y sigue sola (o usa otro si hay).`
+              : ""}{" "}
+            Esta página se actualiza sola.
+          </div>
+        )}
+        {m.email_failed && (
+          <div className="banner warn" role="status">
+            El informe no llegó a estas direcciones: {m.email_failed}
           </div>
         )}
         {m.status === "failed" && (
@@ -99,10 +109,17 @@ export default async function MeetingPage({
               </button>
             </form>
           )}
+          {a && m.email_failed && m.status === "done" && (
+            <form method="post" action={`/api/meetings/${m.id}/resend?only=failed`}>
+              <button className="btn" type="submit">
+                Reintentar solo a los que fallaron
+              </button>
+            </form>
+          )}
           {a && (m.status === "done" || m.status === "failed") && (
             <form method="post" action={`/api/meetings/${m.id}/resend`}>
               <button className="btn secondary" type="submit">
-                Reenviar correo
+                Reenviar a todos
               </button>
             </form>
           )}

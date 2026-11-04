@@ -13,6 +13,17 @@ export class ContinueLater extends Error {
   }
 }
 
+/** Hay que esperar hasta `at` (un proveedor de IA está en pausa): la ejecución continúa entonces. */
+export class RetryLater extends ContinueLater {
+  constructor(
+    readonly at: Date,
+    message = "Los proveedores de IA están en pausa",
+  ) {
+    super(message);
+    this.name = "RetryLater";
+  }
+}
+
 export class Budget {
   private progressed = false;
 
@@ -38,6 +49,16 @@ export class Budget {
    */
   ensure(expectedMs: number): void {
     if (this.progressed && Date.now() + expectedMs > this.deadline) throw new ContinueLater();
+  }
+
+  /**
+   * Duerme hasta `ms`, pero sin pasarse del presupuesto (deja 15 s para guardar y relanzar).
+   * Devuelve los milisegundos que aún quedan por esperar.
+   */
+  async sleepUpTo(ms: number): Promise<number> {
+    const can = Math.max(0, Math.min(ms, this.remainingMs() - 15_000));
+    if (can > 0) await new Promise((r) => setTimeout(r, can));
+    return Math.max(0, ms - can);
   }
 
   /** Espera `ms` (p. ej. a que se renueve el límite por minuto) si cabe en el presupuesto. */

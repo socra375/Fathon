@@ -8,7 +8,7 @@
 // Uso: npm run build && npm run e2e
 import { spawn, execFileSync, execSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 
@@ -129,10 +129,11 @@ const appEnv = {
   // Transcripción gratuita (Whisper en Groq). Sin clave de Deepgram, se usa Groq.
   GROQ_API_KEY: "test-groq",
   GROQ_API_URL: `http://127.0.0.1:${MOCK_PORT}/groq`,
-  // Sin clave de Anthropic → análisis gratuito en Groq. Tramos y presupuesto de tiempo diminutos
-  // para obligar a dividir, combinar y continuar en varias invocaciones.
+  // Sin clave de Anthropic → análisis gratuito en Groq. Se fuerzan tramos diminutos para obligar a dividir y
+  // combinar, y un presupuesto de 20 s por invocación para que las esperas largas se repartan en varias.
+  ANALYSIS_MODE: "chunks",
   ANALYSIS_CHUNK_TOKENS: "80",
-  PROCESSING_BUDGET_MS: "2500",
+  PROCESSING_BUDGET_MS: "20000",
   RESEND_API_KEY: "test-resend",
   RESEND_API_URL: `http://127.0.0.1:${MOCK_PORT}/resend`,
 };
@@ -152,6 +153,12 @@ async function stopApp() {
   await exited;
 }
 await startApp();
+
+const MOCK = `http://127.0.0.1:${MOCK_PORT}`;
+const control = async (body) => (await fetch(`${MOCK}/__control`, { method: "POST", body: JSON.stringify(body) })).json();
+const snap = async () => (await fetch(`${MOCK}/__captured`)).json();
+// El primer 429 del análisis pide esperar 12 s: más de lo que cabe en una invocación → la app debe esperar y continuar sola.
+await control({ groqChat429RetryAfter: 12 });
 
 const db = new Client({ connectionString: DATABASE_URL });
 await db.connect();
@@ -312,7 +319,7 @@ const row = await waitFor(
     if (r.status === "failed") throw new Error(`falló: ${r.stage} ${r.error}`);
     return r.status === "done" ? r : null;
   },
-  { timeout: 90000, label: "reunión procesada" },
+  { timeout: 150000, label: "reunión procesada" },
 );
 const captured = await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured`)).json();
 
@@ -397,7 +404,8 @@ check("transcripción larga: se analiza por tramos y se combina", () => {
   assert.ok(row.analysis_parts.length >= 2 && row.analysis_parts.every(Boolean), "tramos guardados");
 });
 check("límite por minuto (429): espera y reintenta", () => assert.equal(chatA[0].status, 429));
-check("se agota el tiempo de la invocación: guarda y continúa sola", () => assert.ok(row.continuations >= 1, `continuaciones=${row.continuations}`));
+check("pausa larga de un proveedor: espera y continúa sola en varias invocaciones", () => assert.ok(row.continuations >= 2, `continuaciones=${row.continuations}`));
+check("al terminar la espera no queda pausa pendiente en la reunión", () => assert.equal(row.resume_at, null));
 check("análisis guardado", () => {
   assert.equal(row.analysis.decisions[0], "Retrasar el lanzamiento al día 14.");
   assert.equal(row.title, "Lanzamiento de la versión 2 y presupuesto");
@@ -446,7 +454,7 @@ check("vista móvil sin desplazamiento horizontal", () => assert.equal(overflow,
 await mobile.close();
 
 // Reenviar correo
-await panel.click("text=Reenviar correo");
+await panel.click("text=Reenviar a todos");
 await waitFor(
   async () => (await (await fetch(`http://127.0.0.1:${MOCK_PORT}/__captured`)).json()).resend.length >= 2,
   { timeout: 30000, label: "reenvío" },
@@ -478,6 +486,7 @@ await stopApp();
 await startApp({
   ANTHROPIC_API_KEY: "test-anthropic",
   ANTHROPIC_BASE_URL: `http://127.0.0.1:${MOCK_PORT}/anthropic`,
+  ANALYSIS_MODE: "",
   ANALYSIS_CHUNK_TOKENS: "",
   PROCESSING_BUDGET_MS: "",
 });
@@ -521,8 +530,11 @@ check("con clave de Claude, el análisis lo hace Claude (una llamada, salida est
 });
 check("al cerrar la pestaña, la reunión se procesa y se envía igualmente", () => {
   assert.equal(row2.status, "done");
-  assert.equal(cap2.resend.length, 3);
-  assert.deepEqual(cap2.resend[2].to, ["otro@example.com", "copia@example.com"]);
+  // Se envía a cada destinatario por separado.
+  assert.equal(cap2.resend.length, 4);
+  assert.deepEqual(cap2.resend[2].to, ["otro@example.com"]);
+  assert.deepEqual(cap2.resend[3].to, ["copia@example.com"]);
+  assert.equal(row2.email_to, "otro@example.com, copia@example.com");
 });
 check("sin micrófono solo se transcribe la pista de los demás, en el idioma elegido", () => {
   assert.ok(groqB.length >= 1);
@@ -543,6 +555,180 @@ check("el audio de la pestaña (los demás participantes) se graba fielmente a 4
 check("duración de la grabación abandonada ≈ 20 s", () => assert.ok(groqB[0].duration >= 14, `dur=${groqB[0].duration}`));
 
 await ctxB.close();
+
+// ------------------------------------------------------------------ 5. Rotación entre proveedores
+// Reuniones enviadas directamente a la API con el audio ya grabado, para provocar fallos controlados.
+log("escenario: rotación de proveedores de voz, IA y correo");
+await stopApp();
+const ROTATION_ENV = {
+  ANALYSIS_MODE: "",
+  ANALYSIS_CHUNK_TOKENS: "",
+  PROCESSING_BUDGET_MS: "",
+  DEEPGRAM_API_KEY: "test-deepgram",
+  DEEPGRAM_API_URL: `${MOCK}/deepgram`,
+  GEMINI_API_KEY: "test-gemini",
+  GEMINI_API_URL: `${MOCK}/gemini`,
+  OPENROUTER_API_KEY: "test-openrouter",
+  OPENROUTER_API_URL: `${MOCK}/openrouter`,
+  SMTP_HOST: "127.0.0.1",
+  SMTP_PORT: "4025",
+  SMTP_USER: "minuta@example.com",
+  SMTP_PASS: "app password de prueba",
+};
+await startApp(ROTATION_ENV);
+await db.query("DELETE FROM provider_state");
+const RECIPIENTS = "destinatario@example.com, otro@example.com, copia@example.com";
+await db.query("INSERT INTO settings (key, value) VALUES ('email_to', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value", [RECIPIENTS]);
+await control({ whisper429For: 600, gemini429: false, openrouter429: false, resendOwn: "destinatario@example.com", deepgram401: false });
+
+const KEY_H = { Authorization: `Bearer ${API_KEY}` };
+async function apiMeeting(title) {
+  const r = await fetch(`${APP}/api/sessions`, {
+    method: "POST",
+    headers: { ...KEY_H, "Content-Type": "application/json" },
+    body: JSON.stringify({ platform: "meet", title, url: "https://meet.google.com/abc-defg-hij", timezone: "America/Mexico_City" }),
+  });
+  const { id } = await r.json();
+  for (const [track, file] of [["tab", tabCalls[0].file], ["mic", micCalls[0].file]]) {
+    const cr = await fetch(`${APP}/api/sessions/${id}/chunks?seq=0&track=${track}&seg=0&segStart=0`, { method: "POST", headers: KEY_H, body: readFileSync(file) });
+    assert.equal(cr.status, 200);
+  }
+  const fr = await fetch(`${APP}/api/sessions/${id}/finish`, { method: "POST", headers: { ...KEY_H, "Content-Type": "application/json" }, body: JSON.stringify({ durationSec: 20 }) });
+  assert.equal(fr.status, 202);
+  return id;
+}
+const waitDone = (id, label) =>
+  waitFor(
+    async () => {
+      const r = (await db.query("SELECT * FROM meetings WHERE id = $1", [id])).rows[0];
+      if (r.status === "failed") throw new Error(`falló: ${r.stage} ${r.error}`);
+      return r.status === "done" ? r : null;
+    },
+    { timeout: 90000, label },
+  );
+const pauses = async () => Object.fromEntries((await db.query("SELECT provider, blocked_until, reason FROM provider_state")).rows.map((r) => [r.provider, r]));
+
+// 5a. Whisper sin cupo → Deepgram; Gemini analiza de una vez; Resend solo envía a la cuenta propia → el resto por SMTP.
+const b0 = await snap();
+const idA = await apiMeeting("Rotación A");
+const rowA = await waitDone(idA, "reunión A (rotación)");
+const cA = await snap();
+const pA = await pauses();
+check("Whisper sin cupo (429): solo falla una vez y se pasa a Deepgram", () => {
+  assert.equal(cA.groqFail.length - b0.groqFail.length, 1, "Whisper se intentó más de una vez");
+  assert.equal(cA.deepgram.length - b0.deepgram.length, 2, "Deepgram debe transcribir las dos pistas");
+  assert.equal(cA.deepgram.at(-1).auth, "Token test-deepgram");
+});
+check("el proveedor agotado queda en pausa y se anota cuándo vuelve", () => {
+  assert.ok(pA["stt:groq"], JSON.stringify(Object.keys(pA)));
+  assert.ok(new Date(pA["stt:groq"].blocked_until).getTime() > Date.now() + 300_000, "la pausa debería ser de unos 10 min");
+});
+check("la transcripción conserva «Tú» y distingue participantes", () => {
+  const labels = new Set(rowA.transcript.map((u) => u.label));
+  assert.ok(labels.has("Tú"), [...labels].join(","));
+  assert.ok([...labels].some((l) => /^Participante \d/.test(l)), [...labels].join(","));
+});
+check("Gemini analiza la reunión completa en una sola petición (no se usa Groq)", () => {
+  const g = cA.gemini.slice(b0.gemini.length);
+  assert.equal(g.length, 1);
+  assert.equal(g[0].status, 200);
+  assert.equal(g[0].auth, "Bearer test-gemini");
+  assert.ok(!/PARTE \d+ de/.test(g[0].user));
+  assert.equal(cA.groqChat.length, b0.groqChat.length);
+  assert.equal(rowA.title, "Análisis hecho por Gemini");
+});
+const decodeMime = (v) =>
+  v.replace(/=\?UTF-8\?Q\?(.*?)\?=/g, (_, q) =>
+    Buffer.from(q.replace(/_/g, " ").replace(/=([0-9A-F]{2})/g, (_m, h) => String.fromCharCode(parseInt(h, 16))), "latin1").toString("utf8"),
+  );
+check("varios destinatarios: Resend envía al suyo y SMTP al resto", () => {
+  assert.deepEqual(cA.resend.slice(b0.resend.length).map((m) => m.to), [["destinatario@example.com"]]);
+  assert.equal(cA.resendRefused.length - b0.resendRefused.length, 2);
+  const smtp = cA.smtp.slice(b0.smtp.length);
+  assert.deepEqual(smtp.map((m) => m.to[0]).sort(), ["copia@example.com", "otro@example.com"]);
+  assert.ok(smtp.every((m) => m.hasAttachment && m.user === "minuta@example.com" && /^Minuta · An/.test(decodeMime(m.subject))), JSON.stringify(smtp));
+  assert.equal(rowA.email_to, RECIPIENTS);
+  assert.ok(!rowA.email_failed, rowA.email_failed);
+});
+
+// 5b. Gemini sin cuota diaria → OpenRouter; la pausa se recuerda y las demás reuniones ni lo intentan.
+await control({ gemini429: true });
+const idB = await apiMeeting("Rotación B");
+const rowB = await waitDone(idB, "reunión B (rotación)");
+const cB = await snap();
+const pB = await pauses();
+check("Gemini sin cuota (429): se pasa a OpenRouter", () => {
+  const g = cB.gemini.slice(cA.gemini.length);
+  const o = cB.openrouter.slice(cA.openrouter.length);
+  assert.equal(g.length, 1);
+  assert.equal(g[0].status, 429);
+  assert.equal(o.length, 1);
+  assert.equal(o[0].status, 200);
+  assert.equal(o[0].auth, "Bearer test-openrouter");
+  assert.equal(o[0].title, "Minuta");
+  assert.equal(rowB.title, "Análisis hecho por OpenRouter");
+});
+check("Whisper sigue en pausa: la reunión siguiente ni lo intenta", () => {
+  assert.equal(cB.groqFail.length, cA.groqFail.length);
+  assert.equal(cB.groq.length, cA.groq.length);
+  assert.equal(cB.deepgram.length - cA.deepgram.length, 2);
+});
+check("Gemini queda en pausa con la hora de vuelta", () => {
+  assert.ok(pB["analysis:gemini"], JSON.stringify(Object.keys(pB)));
+  assert.ok(new Date(pB["analysis:gemini"].blocked_until).getTime() > Date.now() + 60_000);
+});
+const idC = await apiMeeting("Rotación C");
+const rowC = await waitDone(idC, "reunión C (rotación)");
+const cC = await snap();
+check("con Gemini en pausa, la siguiente reunión va directa a OpenRouter", () => {
+  assert.equal(cC.gemini.length, cB.gemini.length, "no debe llamar a Gemini mientras está en pausa");
+  assert.equal(cC.openrouter.length - cB.openrouter.length, 1);
+  assert.equal(rowC.title, "Análisis hecho por OpenRouter");
+});
+
+// 5c. Sin SMTP y con Resend limitado: el informe llega a quien se puede y se avisa de los demás; luego se reintenta.
+await stopApp();
+await startApp({ ...ROTATION_ENV, SMTP_USER: "", SMTP_PASS: "" });
+await db.query("DELETE FROM provider_state");
+await control({ gemini429: false, whisper429For: 0 });
+const idD = await apiMeeting("Rotación D");
+const rowD = await waitDone(idD, "reunión D (entrega parcial)");
+check("entrega parcial: llega a quien se puede y se anota a quién no", () => {
+  assert.equal(rowD.status, "done");
+  assert.equal(rowD.email_to, "destinatario@example.com");
+  assert.match(rowD.email_failed, /otro@example\.com/);
+  assert.match(rowD.email_failed, /copia@example\.com/);
+});
+await panel.goto(`${APP}/dashboard/meetings/${idD}`);
+if (/\/login/.test(panel.url())) {
+  await panel.fill("#password", PASSWORD);
+  await panel.click("button[type=submit]");
+  await panel.goto(`${APP}/dashboard/meetings/${idD}`);
+}
+await panel.screenshot({ path: path.join(TMP, "11-partial-delivery.png"), fullPage: true });
+const partialText = await panel.textContent("body");
+check("la página de la reunión avisa de quién no recibió el correo", () => {
+  assert.ok(partialText.includes("otro@example.com"));
+  assert.ok(partialText.includes("Reintentar solo a los que fallaron"));
+});
+await control({ resendOwn: null });
+const beforeRetry = await snap();
+await panel.click("text=Reintentar solo a los que fallaron");
+const rowD2 = await waitFor(
+  async () => {
+    const r = (await db.query("SELECT * FROM meetings WHERE id = $1", [idD])).rows[0];
+    return r.status === "done" && !r.email_failed ? r : null;
+  },
+  { timeout: 60000, label: "reintento solo a los que fallaron" },
+);
+const cD = await snap();
+check("«Reintentar solo a los que fallaron» no repite el envío a quien ya lo recibió", () => {
+  assert.deepEqual(cD.resend.slice(beforeRetry.resend.length).map((m) => m.to[0]).sort(), ["copia@example.com", "otro@example.com"]);
+  assert.equal(rowD2.email_to, RECIPIENTS);
+  assert.equal(cD.groq.length + cD.deepgram.length, beforeRetry.groq.length + beforeRetry.deepgram.length, "no se vuelve a transcribir");
+  assert.equal(cD.gemini.length, beforeRetry.gemini.length, "no se vuelve a analizar");
+});
+
 await plain.close();
 await db.end();
 
